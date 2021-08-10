@@ -22,6 +22,7 @@ func NewRootCmd() *cobra.Command {
 			cfg.Level = zap.NewAtomicLevelAt(opts.logLevel.Level)
 			cfg.OutputPaths = opts.logOutput
 			cfg.ErrorOutputPaths = opts.logOutput
+			cfg.DisableStacktrace = !cfg.Level.Enabled(zap.DebugLevel)
 			logger, _ := cfg.Build()
 			zap.ReplaceGlobals(logger)
 		},

@@ -135,33 +135,30 @@ func NewTextPlayCommand() *cobra.Command {
 				}
 			}
 
+			fields := make([]zap.Field, 0, 7)
+			loadFields := func() {
+				metrics := stats.Dump()
+				fields = fields[:0]
+				for _, name := range []string{
+					stats.Connections, stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
+					stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
+				} {
+					fields = append(fields, zap.Int64(name, metrics[name]))
+				}
+			}
 			control.wg.Add(1)
 			go func() {
-				fields := make([]zap.Field, 0, 7)
 				ticker := time.NewTicker(reportInterval)
-				load := func() {
-					metrics := stats.Dump()
-					fields = fields[:0]
-					for _, name := range []string{
-						stats.Connections, stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
-						stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
-					} {
-						fields = append(fields, zap.Int64(name, metrics[name]))
-					}
-				}
 				defer func() {
 					ticker.Stop()
 					control.wg.Done()
-					control.wg.Wait()
-					load()
-					control.log.Info("done", fields...)
 				}()
 				for {
 					select {
 					case <-done:
 						return
 					case <-ticker.C:
-						load()
+						loadFields()
 						control.log.Info("stats", fields...)
 					}
 				}
@@ -173,6 +170,8 @@ func NewTextPlayCommand() *cobra.Command {
 			}
 			close(done)
 			control.Stop()
+			loadFields()
+			control.log.Info("done", fields...)
 			return nil
 		},
 	}
@@ -347,9 +346,10 @@ func (pw *playWorker) start(ctx context.Context) {
 		case event.EventStmtClose:
 			pw.stmtClose(ctx, e.StmtID)
 		case event.EventHandshake:
+			pw.quit(false)
 			err = pw.handshake(ctx, e.DB)
 		case event.EventQuit:
-			pw.quit()
+			pw.quit(false)
 		default:
 			pw.log.Warn("unknown event", zap.Any("value", e))
 			continue
@@ -357,6 +357,7 @@ func (pw *playWorker) start(ctx context.Context) {
 		if err != nil {
 			if connErr := errors.Unwrap(err); connErr == sql.ErrConnDone || connErr == mysql.ErrInvalidConn || connErr == context.DeadlineExceeded {
 				pw.log.Warn("reconnect after "+e.String(), zap.String("cause", connErr.Error()))
+				pw.quit(true)
 				err = pw.handshake(ctx, pw.schema)
 				if err != nil {
 					pw.log.Warn("reconnect error", zap.Error(err))
@@ -369,7 +370,6 @@ func (pw *playWorker) start(ctx context.Context) {
 }
 
 func (pw *playWorker) handshake(ctx context.Context, schema string) error {
-	pw.quit()
 	cfg := pw.cfg
 	if len(schema) > 0 && cfg.DBName != schema {
 		cfg = cfg.Clone()
@@ -385,12 +385,17 @@ func (pw *playWorker) handshake(ctx context.Context, schema string) error {
 	return err
 }
 
-func (pw *playWorker) quit() {
+func (pw *playWorker) quit(reconnect bool) {
 	for id, stmt := range pw.stmts {
 		if stmt.handle != nil {
 			stmt.handle.Close()
+			stmt.handle = nil
 		}
-		delete(pw.stmts, id)
+		if reconnect {
+			pw.stmts[id] = stmt
+		} else {
+			delete(pw.stmts, id)
+		}
 	}
 	if pw.conn != nil {
 		pw.conn.Close()
@@ -470,6 +475,7 @@ func (pw *playWorker) stmtClose(ctx context.Context, id uint64) {
 	}
 	if stmt.handle != nil {
 		stmt.handle.Close()
+		stmt.handle = nil
 	}
 	delete(pw.stmts, id)
 }
