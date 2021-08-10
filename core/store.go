@@ -12,9 +12,10 @@ import (
 	"sync"
 
 	"github.com/gocraft/dbr/v2"
-	"github.com/juju/errors"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/pingcap/errors"
 	"go.uber.org/zap"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type ReplayReq struct {

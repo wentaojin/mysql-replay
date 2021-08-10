@@ -2,44 +2,76 @@ package stream
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
-	"io"
-	"strconv"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/reassembly"
-	"github.com/juju/errors"
 	"github.com/zyguan/mysql-replay/stats"
 	"go.uber.org/zap"
 )
 
-type ConnKey [2]gopacket.Flow
+type MySQLPacket struct {
+	Conn ConnID
+	Time time.Time
+	Dir  reassembly.TCPFlowDirection
+	Len  int
+	Seq  int
+	Data []byte
+}
 
-func (k ConnKey) SrcAddr() string {
+type ConnID [2]gopacket.Flow
+
+func (k ConnID) SrcAddr() string {
 	return k[0].Src().String() + ":" + k[1].Src().String()
 }
 
-func (k ConnKey) DstAddr() string {
+func (k ConnID) DstAddr() string {
 	return k[0].Dst().String() + ":" + k[1].Dst().String()
 }
 
-func (k ConnKey) String() string {
+func (k ConnID) String() string {
 	return k.SrcAddr() + "->" + k.DstAddr()
 }
 
-func (k ConnKey) Reverse() ConnKey {
-	return ConnKey{k[0].Reverse(), k[1].Reverse()}
+func (k ConnID) Reverse() ConnID {
+	return ConnID{k[0].Reverse(), k[1].Reverse()}
+}
+
+func (k ConnID) Hash() uint64 {
+	h := fnvHash(k[0].Src().Raw(), k[1].Src().Raw()) + fnvHash(k[0].Dst().Raw(), k[1].Dst().Raw())
+	h ^= uint64(k[0].EndpointType())
+	h *= fnvPrime
+	h ^= uint64(k[1].EndpointType())
+	h *= fnvPrime
+	return h
+}
+
+func (k ConnID) HashStr() string {
+	buf := [8]byte{}
+	binary.LittleEndian.PutUint64(buf[:], k.Hash())
+	return hex.EncodeToString(buf[:])
+}
+
+func (k ConnID) Logger(name string) *zap.Logger {
+	logger := zap.L().With(zap.String("conn", k.HashStr()+":"+k.SrcAddr()))
+	if len(name) > 0 {
+		logger = logger.Named(name)
+	}
+	return logger
 }
 
 type FactoryOptions struct {
 	ConnCacheSize uint
+	Synchronized  bool
+	ForceStart    bool
 }
 
-func NewMySQLStreamFactory(factory func(key ConnKey) MySQLStreamHandler, opts FactoryOptions) reassembly.StreamFactory {
+func NewFactoryFromPacketHandler(factory func(ConnID) MySQLPacketHandler, opts FactoryOptions) reassembly.StreamFactory {
 	if factory == nil {
-		factory = defaultStreamHandlerFactory
+		factory = defaultHandlerFactory
 	}
 	return &mysqlStreamFactory{new: factory, opts: opts}
 }
@@ -47,46 +79,56 @@ func NewMySQLStreamFactory(factory func(key ConnKey) MySQLStreamHandler, opts Fa
 var _ reassembly.StreamFactory = &mysqlStreamFactory{}
 
 type mysqlStreamFactory struct {
-	new  func(key ConnKey) MySQLStreamHandler
+	new  func(key ConnID) MySQLPacketHandler
 	opts FactoryOptions
 }
 
 func (f *mysqlStreamFactory) New(netFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, ac reassembly.AssemblerContext) reassembly.Stream {
-	key := ConnKey{netFlow, tcpFlow}
-	log := zap.L().Named("mysql-stream").With(zap.String("conn", key.String()))
-	handler, ch, done := f.new(key), make(chan MySQLPayload, f.opts.ConnCacheSize), make(chan struct{})
-	go func() {
-		defer close(done)
-		for p := range ch {
-			handler.OnPayload(p)
-		}
-	}()
+	conn := ConnID{netFlow, tcpFlow}
+	log := conn.Logger("mysql-stream")
+	h, ch, done := f.new(conn), make(chan MySQLPacket, f.opts.ConnCacheSize), make(chan struct{})
+	if !f.opts.Synchronized {
+		go func() {
+			defer close(done)
+			for pkt := range ch {
+				h.OnPacket(pkt)
+			}
+		}()
+	}
 	stats.Add(stats.Streams, 1)
-	return &mysqlStream{key, log, nil, 0, ch, done, handler, f.opts}
+	return &mysqlStream{
+		conn: conn,
+		log:  log,
+		ch:   ch,
+		done: done,
+		h:    h,
+		opts: f.opts,
+	}
 }
 
 var _ reassembly.Stream = &mysqlStream{}
 
 type mysqlStream struct {
-	key ConnKey
+	conn ConnID
+
 	log *zap.Logger
-
 	buf *bytes.Buffer
-	seq int
+	pkt *MySQLPacket
 
-	ch   chan MySQLPayload
+	ch   chan MySQLPacket
 	done chan struct{}
 
-	h    MySQLStreamHandler
+	h    MySQLPacketHandler
 	opts FactoryOptions
 }
 
 func (s *mysqlStream) Accept(tcp *layers.TCP, ci gopacket.CaptureInfo, dir reassembly.TCPFlowDirection, nextSeq reassembly.Sequence, start *bool, ac reassembly.AssemblerContext) bool {
-	// TODO: do basic validation, ref: https://github.com/google/gopacket/blob/ec90f6c2c025516eabdf6bf374b615ff0bf32c21/examples/reassemblydump/main.go#L336
-	if !s.h.Accept(tcp, dir, nextSeq) {
+	if !s.h.Accept(ci, dir, tcp) {
 		return false
 	}
-	*start = true
+	if s.opts.ForceStart {
+		*start = true
+	}
 	return true
 }
 
@@ -103,46 +145,59 @@ func (s *mysqlStream) ReassembledSG(sg reassembly.ScatterGather, ac reassembly.A
 	data := sg.Fetch(length)
 	dir, _, _, _ := sg.Info()
 
-	p := MySQLPayload{T: ac.GetCaptureInfo().Timestamp, Key: s.key, Dir: dir}
-	buf := s.buf
-	if buf == nil {
-		buf = bytes.NewBuffer(data)
-		s.seq = lookupPacketSeq(buf)
-	} else {
-		buf.Write(data)
-	}
-	for buf.Len() > 0 {
-		restData, size := buf.Bytes(), lookupPacketSize(buf)
-		if size+4 > buf.Len() {
-			s.buf = buf
+	if s.buf == nil {
+		buf := bytes.NewBuffer(data)
+		seq := lookupPacketSeq(buf)
+		if seq != 0 {
+			s.log.Info("drop init packet with non-zero seq", zap.String("data", hex.EncodeToString(data)))
 			return
 		}
-		pkt, err := readPacket(buf)
-		if err != nil {
-			s.log.Error("read mysql packet",
-				zap.Int("size", size),
-				zap.Int("len", len(data)),
-				zap.String("raw", hex.EncodeToString(restData)),
-				zap.Error(err))
-		}
-		p.Packets = append(p.Packets, pkt)
+		s.buf = buf
+	} else {
+		s.buf.Write(data)
 	}
-	p.StartSeq = s.seq
-	s.buf, s.seq = nil, 0
 
-	s.ch <- p
-	stats.Add(stats.Packets, 1)
+	for s.buf.Len() > 0 {
+		pkt := s.pkt
+		if pkt == nil {
+			pkt = &MySQLPacket{
+				Conn: s.conn,
+				Time: ac.GetCaptureInfo().Timestamp,
+				Dir:  dir,
+				Len:  lookupPacketLen(s.buf),
+				Seq:  lookupPacketSeq(s.buf),
+			}
+		}
+		if pkt.Seq == -1 || s.buf.Len() < pkt.Len+4 {
+			s.log.Debug("wait for more packet data", zap.String("dir", dir.String()))
+			if s.pkt == nil && pkt.Seq >= 0 {
+				s.pkt = pkt
+			}
+			return
+		}
+		pkt.Data = make([]byte, pkt.Len)
+		copy(pkt.Data, s.buf.Next(pkt.Len + 4)[4:])
+		stats.Add(stats.Packets, 1)
+		if s.opts.Synchronized {
+			s.h.OnPacket(*pkt)
+		} else {
+			s.ch <- *pkt
+		}
+		s.pkt = nil
+	}
 }
 
 func (s *mysqlStream) ReassemblyComplete(ac reassembly.AssemblerContext) bool {
 	close(s.ch)
-	<-s.done
+	if !s.opts.Synchronized {
+		<-s.done
+	}
 	s.h.OnClose()
 	stats.Add(stats.Streams, -1)
 	return false
 }
 
-func lookupPacketSize(buf *bytes.Buffer) int {
+func lookupPacketLen(buf *bytes.Buffer) int {
 	if buf.Len() < 3 {
 		return -1
 	}
@@ -157,55 +212,18 @@ func lookupPacketSeq(buf *bytes.Buffer) int {
 	return int(buf.Bytes()[3])
 }
 
-func readPacket(r io.Reader) ([]byte, error) {
-	data, err := readOnePacket(r, nil)
-	if err != nil {
-		return nil, err
-	}
-	if len(data) < maxPacketSize {
-		return data, nil
-	}
+const (
+	fnvBasis = 14695981039346656037
+	fnvPrime = 1099511628211
+)
 
-	// handle multi-packet
-	var seq uint8
-	for {
-		seq += 1
-		buf, err := readOnePacket(r, &seq)
-		if err != nil {
-			return nil, err
-		}
-		data = append(data, buf...)
-		if len(buf) < maxPacketSize {
-			break
+func fnvHash(chunks ...[]byte) (h uint64) {
+	h = fnvBasis
+	for _, chunk := range chunks {
+		for i := 0; i < len(chunk); i++ {
+			h ^= uint64(chunk[i])
+			h *= fnvPrime
 		}
 	}
-
-	return data, nil
-}
-
-func readOnePacket(r io.Reader, seq *uint8) ([]byte, error) {
-	var header [4]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return nil, errors.Annotate(err, "read header")
-	}
-
-	if seq != nil && header[3] != *seq {
-		return nil, errors.New("invalid sequence: " + strconv.Itoa(int(header[3])) + " != " + strconv.Itoa(int(*seq)))
-	}
-	size := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16)
-
-	payload := make([]byte, size)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, errors.Annotate(err, "read payload")
-	}
-
-	return payload, nil
-}
-
-type MySQLPayload struct {
-	T        time.Time
-	Key      ConnKey
-	Dir      reassembly.TCPFlowDirection
-	StartSeq int
-	Packets  [][]byte
+	return
 }

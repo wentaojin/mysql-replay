@@ -9,7 +9,7 @@ import (
 
 func main() {
 	if err := cmd.NewRootCmd().Execute(); err != nil {
-		zap.L().Error("command exit with error:", zap.Error(err))
+		zap.L().Error("error exit: "+err.Error(), zap.Error(err))
 		os.Exit(1)
 	}
 }

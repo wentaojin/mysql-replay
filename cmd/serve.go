@@ -7,7 +7,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/reassembly"
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 	"github.com/spf13/cobra"
 	"github.com/zyguan/mysql-replay/core"
 	"github.com/zyguan/mysql-replay/stream"
@@ -27,7 +27,7 @@ func NewServeCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ch := make(chan gopacket.Packet, 512)
 			consume := func(pkt gopacket.Packet) { ch <- pkt }
-			factory := stream.NewMySQLStreamFactory(opts.NewStreamHandler, opts.FactoryOptions)
+			factory := stream.NewFactoryFromPacketHandler(opts.NewPacketHandler, opts.FactoryOptions)
 			pool := reassembly.NewStreamPool(factory)
 			assembler := reassembly.NewAssembler(pool)
 			ticker := time.Tick(time.Minute)
@@ -69,7 +69,7 @@ func NewServeCmd() *cobra.Command {
 					assembler.AssembleWithContext(
 						pkt.NetworkLayer().NetworkFlow(),
 						pkt.Layer(layers.LayerTypeTCP).(*layers.TCP),
-						wrapCaptureInfo(pkt.Metadata().CaptureInfo))
+						captureContext(pkt.Metadata().CaptureInfo))
 				case <-ticker:
 					assembler.FlushCloseOlderThan(time.Now().Add(-2 * time.Minute))
 				}

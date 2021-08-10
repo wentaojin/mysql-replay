@@ -24,6 +24,7 @@ type ReplayFlags struct {
 func (rf *ReplayFlags) Register(flags *pflag.FlagSet, defaultCCSize uint) {
 	flags.StringVar(&rf.TargetDSN, "target-dsn", "", "target dsn")
 	flags.BoolVar(&rf.DryRun, "dry-run", false, "dry run mode (just print statements)")
+	flags.BoolVar(&rf.ForceStart, "force-start", false, "accept streams even if no SYN have been seen")
 	flags.UintVar(&rf.ConnCacheSize, "conn-cache-size", defaultCCSize, "packet cache size for each connection")
 	flags.IntSliceVar(&rf.Ports, "ports", []int{4000}, "ports to filter in")
 	flags.Float64Var(&rf.Speed, "speed", 1, "replay speed ratio")
@@ -42,7 +43,7 @@ func NewReplayCmd() *cobra.Command {
 
 			ch := make(chan gopacket.Packet, 512)
 			consume := func(pkt gopacket.Packet) { ch <- pkt }
-			factory := stream.NewMySQLStreamFactory(opts.NewStreamHandler, opts.FactoryOptions)
+			factory := stream.NewFactoryFromPacketHandler(opts.NewPacketHandler, opts.FactoryOptions)
 			pool := reassembly.NewStreamPool(factory)
 			assembler := reassembly.NewAssembler(pool)
 			ticker := time.Tick(time.Minute)
@@ -94,7 +95,7 @@ func NewReplayCmd() *cobra.Command {
 					assembler.AssembleWithContext(
 						pkt.NetworkLayer().NetworkFlow(),
 						pkt.Layer(layers.LayerTypeTCP).(*layers.TCP),
-						wrapCaptureInfo(pkt.Metadata().CaptureInfo))
+						captureContext(pkt.Metadata().CaptureInfo))
 				case <-ticker:
 					assembler.FlushCloseOlderThan(time.Now().Add(-2 * time.Minute))
 				}
@@ -104,10 +105,4 @@ func NewReplayCmd() *cobra.Command {
 	opts.Register(cmd.Flags(), 0)
 	cmd.PersistentFlags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
 	return cmd
-}
-
-type wrapCaptureInfo gopacket.CaptureInfo
-
-func (ci wrapCaptureInfo) GetCaptureInfo() gopacket.CaptureInfo {
-	return gopacket.CaptureInfo(ci)
 }

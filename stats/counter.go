@@ -6,24 +6,33 @@ import (
 )
 
 const (
-	Packets     = "packets"
-	Queries     = "queries"
-	Streams     = "streams"
-	Connections = "connections"
+	Packets      = "packets"
+	Queries      = "queries"
+	Streams      = "streams"
+	Connections  = "connections"
+	StmtExecutes = "stmt.executes"
+	StmtPrepares = "stmt.prepares"
 
-	FailedQueries = "err.queries"
+	FailedQueries      = "err.queries"
+	FailedStmtExecutes = "err.stmt.executes"
+	FailedStmtPrepares = "err.stmt.prepares"
 )
 
 var (
-	nPackets int64
-	nQueries int64
-	nStreams int64
-	nConns   int64
+	nPackets      int64
+	nQueries      int64
+	nStreams      int64
+	nConns        int64
+	nStmtExecutes int64
+	nStmtPrepares int64
 
-	nErrQueries int64
+	nErrQueries      int64
+	nErrStmtExecutes int64
+	nErrStmtPrepares int64
 
-	others = make(map[string]int64)
-	lock   sync.RWMutex
+	metrics = []string{Packets, Queries, StmtExecutes, StmtPrepares, Streams, Connections, FailedQueries, FailedStmtExecutes, FailedStmtPrepares}
+	others  = make(map[string]int64)
+	lock    sync.RWMutex
 )
 
 func Add(name string, delta int64) int64 {
@@ -32,12 +41,20 @@ func Add(name string, delta int64) int64 {
 		return atomic.AddInt64(&nPackets, delta)
 	case Queries:
 		return atomic.AddInt64(&nQueries, delta)
+	case StmtExecutes:
+		return atomic.AddInt64(&nStmtExecutes, delta)
+	case StmtPrepares:
+		return atomic.AddInt64(&nStmtPrepares, delta)
 	case Streams:
 		return atomic.AddInt64(&nStreams, delta)
 	case Connections:
 		return atomic.AddInt64(&nConns, delta)
 	case FailedQueries:
 		return atomic.AddInt64(&nErrQueries, delta)
+	case FailedStmtExecutes:
+		return atomic.AddInt64(&nErrStmtExecutes, delta)
+	case FailedStmtPrepares:
+		return atomic.AddInt64(&nErrStmtPrepares, delta)
 	default:
 		lock.Lock()
 		defer lock.Unlock()
@@ -52,12 +69,20 @@ func Get(name string) int64 {
 		return atomic.LoadInt64(&nPackets)
 	case Queries:
 		return atomic.LoadInt64(&nQueries)
+	case StmtExecutes:
+		return atomic.LoadInt64(&nStmtExecutes)
+	case StmtPrepares:
+		return atomic.LoadInt64(&nStmtPrepares)
 	case Streams:
 		return atomic.LoadInt64(&nStreams)
 	case Connections:
 		return atomic.LoadInt64(&nConns)
 	case FailedQueries:
 		return atomic.LoadInt64(&nErrQueries)
+	case FailedStmtExecutes:
+		return atomic.LoadInt64(&nErrStmtExecutes)
+	case FailedStmtPrepares:
+		return atomic.LoadInt64(&nErrStmtPrepares)
 	default:
 		lock.RLock()
 		defer lock.RUnlock()
@@ -66,18 +91,14 @@ func Get(name string) int64 {
 }
 
 func Dump() map[string]int64 {
+	out := make(map[string]int64, len(metrics)+len(others))
+	for _, name := range metrics {
+		out[name] = Get(name)
+	}
 	lock.RLock()
-	defer lock.RUnlock()
-
-	out := make(map[string]int64, len(others)+5)
 	for k, v := range others {
 		out[k] = v
 	}
-	out[Packets] = nPackets
-	out[Queries] = nQueries
-	out[Streams] = nStreams
-	out[Connections] = nConns
-	out[FailedQueries] = nErrQueries
-
+	lock.RUnlock()
 	return out
 }
