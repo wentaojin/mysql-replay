@@ -5,8 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,35 +36,35 @@ func NewTextDumpCommand() *cobra.Command {
 		Use:   "dump",
 		Short: "Dump pcap files",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var (
-				out = os.Stdout
-				err error
-			)
 			if len(args) == 0 {
 				return cmd.Help()
 			}
 			if len(output) > 0 {
-				out, err = os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-				if err != nil {
-					return err
-				}
-				defer out.Close()
+				os.MkdirAll(output, 0755)
 			}
 
 			factory := stream.NewFactoryFromEventHandler(func(conn stream.ConnID) stream.MySQLEventHandler {
+				log := conn.Logger("dump")
+				out, err := os.CreateTemp(output, "."+conn.HashStr()+".*")
+				if err != nil {
+					log.Error("failed to create file for dumping events", zap.Error(err))
+					return nil
+				}
 				return &textDumpHandler{
-					log: conn.Logger("text-dump"),
-					out: out,
-					buf: make([]byte, 0, 4096),
+					conn: conn,
+					buf:  make([]byte, 0, 4096),
+					log:  log,
+					out:  out,
+					w:    bufio.NewWriterSize(out, 1048576),
 				}
 			}, options)
 			pool := reassembly.NewStreamPool(factory)
 			assembler := reassembly.NewAssembler(pool)
 
-			dumpFrom := func(name string) error {
+			handle := func(name string) error {
 				f, err := pcap.OpenOffline(name)
 				if err != nil {
-					return err
+					return errors.Annotate(err, "open "+name)
 				}
 				defer f.Close()
 				src := gopacket.NewPacketSource(f, f.LinkType())
@@ -76,24 +80,32 @@ func NewTextDumpCommand() *cobra.Command {
 			}
 
 			for _, in := range args {
-				err = dumpFrom(in)
+				zap.L().Info("processing " + in)
+				err := handle(in)
 				if err != nil {
 					return err
 				}
+				assembler.FlushCloseOlderThan(factory.LastStreamTime().Add(-3 * time.Minute))
 			}
+			assembler.FlushAll()
 
 			return nil
 		},
 	}
-	cmd.Flags().StringVarP(&output, "output", "o", "", "output file")
+	cmd.Flags().StringVarP(&output, "output", "o", "", "output directory")
 	cmd.Flags().BoolVar(&options.ForceStart, "force-start", false, "accept streams even if no SYN have been seen")
 	return cmd
 }
 
 type textDumpHandler struct {
-	log *zap.Logger
-	out io.Writer
-	buf []byte
+	conn stream.ConnID
+	buf  []byte
+	log  *zap.Logger
+	out  *os.File
+	w    *bufio.Writer
+
+	fst int64
+	lst int64
 }
 
 func (h *textDumpHandler) OnEvent(e event.MySQLEvent) {
@@ -104,35 +116,44 @@ func (h *textDumpHandler) OnEvent(e event.MySQLEvent) {
 		h.log.Error("failed to dump event", zap.Any("value", e), zap.Error(err))
 		return
 	}
-	h.out.Write(h.buf)
-	h.out.Write([]byte{'\n'})
+	h.w.Write(h.buf)
+	h.w.WriteString("\n")
+	h.lst = e.Time
+	if h.fst == 0 {
+		h.fst = e.Time
+	}
 }
 
-func (h *textDumpHandler) OnClose() {}
+func (h *textDumpHandler) OnClose() {
+	h.w.Flush()
+	h.out.Close()
+	path := h.out.Name()
+	if h.fst == 0 {
+		os.Remove(path)
+	} else {
+		os.Rename(path, filepath.Join(filepath.Dir(path), fmt.Sprintf("%d.%d.%s.tsv", h.fst, h.lst, h.conn.HashStr())))
+	}
+}
 
 func NewTextPlayCommand() *cobra.Command {
 	var (
-		control        = &playControl{wg: new(sync.WaitGroup), workers: map[uint64]*playWorker{}}
+		config         playConfig
 		targetDSN      string
 		reportInterval time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "play",
 		Short: "Play mysql events from text files",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 {
-				return cmd.Help()
-			}
 			var (
 				done = make(chan struct{})
 				err  error
+				ctl  *playControl
 			)
-			control.log = zap.L()
-			if !control.DryRun {
-				control.cfg, err = mysql.ParseDSN(targetDSN)
-				if err != nil {
-					return err
-				}
+			ctl, err = newPlayControl(config, args[0], targetDSN)
+			if err != nil {
+				return err
 			}
 
 			fields := make([]zap.Field, 0, 7)
@@ -140,142 +161,136 @@ func NewTextPlayCommand() *cobra.Command {
 				metrics := stats.Dump()
 				fields = fields[:0]
 				for _, name := range []string{
-					stats.Connections, stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
+					stats.Connections, stats.ConnRunning, stats.ConnWaiting,
+					stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
 					stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
 				} {
 					fields = append(fields, zap.Int64(name, metrics[name]))
 				}
 			}
-			control.wg.Add(1)
+
 			go func() {
 				ticker := time.NewTicker(reportInterval)
-				defer func() {
-					ticker.Stop()
-					control.wg.Done()
-				}()
+				defer ticker.Stop()
 				for {
 					select {
 					case <-done:
 						return
 					case <-ticker.C:
 						loadFields()
-						control.log.Info("stats", fields...)
+						ctl.log.Info("stats", fields...)
 					}
 				}
 			}()
 
-			err = control.Play(context.Background(), args...)
-			if err != nil {
-				return err
-			}
+			ctl.Play(context.Background())
 			close(done)
-			control.Stop()
 			loadFields()
-			control.log.Info("done", fields...)
+			ctl.log.Info("done", fields...)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&targetDSN, "target-dsn", "", "target dsn")
-	cmd.Flags().Float64Var(&control.Speed, "speed", 1, "speed ratio")
-	cmd.Flags().BoolVar(&control.DryRun, "dry-run", false, "dry run mode (just print events)")
-	cmd.Flags().UintVar(&control.QSize, "qsize", 32, "event queue size for each connection")
-	cmd.Flags().IntVar(&control.MaxLineSize, "max-line-size", 16777216, "max line size")
-	cmd.Flags().DurationVar(&control.QueryTimeout, "query-timeout", time.Minute, "timeout for a single query")
+	cmd.Flags().Float64Var(&config.Speed, "speed", 1, "speed ratio")
+	cmd.Flags().BoolVar(&config.DryRun, "dry-run", false, "dry run mode (just print events)")
+	cmd.Flags().IntVar(&config.MaxLineSize, "max-line-size", 16777216, "max line size")
+	cmd.Flags().DurationVar(&config.QueryTimeout, "query-timeout", time.Minute, "timeout for a single query")
 	cmd.Flags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
 	return cmd
 }
 
+type playConfig struct {
+	DryRun        bool
+	Speed         float64
+	PlayStartTime int64
+	OrigStartTime int64
+	MaxLineSize   int
+	QueryTimeout  time.Duration
+	MySQLConfig   *mysql.Config
+}
+
+func (opts playConfig) Ready(t int64) bool {
+	if opts.Speed <= 0 {
+		return true
+	}
+	return opts.Speed*float64(time.Now().UnixNano()/int64(time.Millisecond)-opts.PlayStartTime) >= float64(t-opts.OrigStartTime)
+}
+
+func (opts playConfig) WaitTime(t int64) time.Duration {
+	if opts.Speed <= 0 {
+		return 0
+	}
+	return time.Duration((float64(t-opts.OrigStartTime)/opts.Speed+float64(opts.PlayStartTime))*float64(time.Millisecond) - float64(time.Now().UnixNano()))
+}
+
 type playControl struct {
-	DryRun       bool
-	QSize        uint
-	Speed        float64
-	MaxLineSize  int
-	QueryTimeout time.Duration
+	playConfig
 
-	playStartedAt int64
-	emitStartedAt int64
-
-	log *zap.Logger
-	cfg *mysql.Config
-
+	log     *zap.Logger
 	wg      *sync.WaitGroup
-	workers map[uint64]*playWorker
+	workers []*playWorker
 }
 
-func (pc *playControl) Play(ctx context.Context, inputs ...string) error {
-	pc.playStartedAt = time.Now().UnixNano() / int64(time.Millisecond)
-	pc.emitStartedAt = 0
-	for _, in := range inputs {
-		err := pc.playOne(ctx, in)
-		if err != nil {
-			return errors.Annotatef(err, "play %q", in)
-		}
-	}
-	return nil
-}
-
-func (pc *playControl) Stop() {
-	for id, pw := range pc.workers {
-		pw.stop()
-		delete(pc.workers, id)
-	}
-	pc.wg.Wait()
-}
-
-func (pc *playControl) playOne(ctx context.Context, input string) error {
-	in, err := os.Open(input)
+func newPlayControl(cfg playConfig, input string, target string) (*playControl, error) {
+	files, err := ioutil.ReadDir(input)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer in.Close()
-
-	var (
-		e      event.MySQLEvent
-		params = make([]interface{}, 0, 8)
-	)
-
-	sc := bufio.NewScanner(in)
-	if pc.MaxLineSize > 0 {
-		buf := make([]byte, 0, 4096)
-		sc.Buffer(buf, pc.MaxLineSize)
-	}
-	for sc.Scan() {
-		_, err = event.ScanEvent(sc.Text(), 0, e.Reset(params[:0]))
-		if err != nil {
-			return err
-		}
-		if pc.emitStartedAt == 0 {
-			pc.emitStartedAt = e.Time
-		}
-		for pc.Speed > 0 && float64(time.Now().UnixNano()/int64(time.Millisecond)-pc.playStartedAt)*pc.Speed < float64(e.Time-pc.emitStartedAt) {
-			time.Sleep(time.Millisecond)
-		}
-		if pc.DryRun {
-			pc.log.Info(e.String())
+	ctl := &playControl{playConfig: cfg, log: zap.L(), wg: new(sync.WaitGroup), workers: make([]*playWorker, 0, len(files))}
+	for _, file := range files {
+		if file.IsDir() {
 			continue
 		}
-		pw := pc.workers[e.Conn]
-		if pw == nil {
-			pw = &playWorker{
-				id:      e.Conn,
-				log:     pc.log.With(zap.String("conn", fmt.Sprintf("%x", e.Conn))),
-				cfg:     pc.cfg,
-				wg:      pc.wg,
-				timeout: pc.QueryTimeout,
-				ch:      make(chan event.MySQLEvent, pc.QSize),
-				stmts:   make(map[uint64]statement),
-			}
-			pc.workers[e.Conn] = pw
-			pc.wg.Add(1)
-			go pw.start(ctx)
+		info := strings.Split(filepath.Base(file.Name()), ".")
+		if len(info) != 4 && info[3] != "tsv" {
+			continue
 		}
-		pw.push(e)
-		if e.Type == event.EventQuit {
-			pw.stop()
-			delete(pc.workers, e.Conn)
+		ts, err := strconv.ParseInt(info[0], 10, 64)
+		if err != nil {
+			ctl.log.Warn("skip input file", zap.String("name", file.Name()), zap.Error(err))
+			continue
+		}
+		id, err := strconv.ParseUint(info[2], 16, 64)
+		if err != nil {
+			ctl.log.Warn("skip input file", zap.String("name", file.Name()), zap.Error(err))
+			continue
+		}
+		ctl.workers = append(ctl.workers, &playWorker{
+			playConfig: ctl.playConfig,
+			src:        filepath.Join(input, file.Name()),
+			log:        ctl.log.Named(info[2]),
+			wg:         ctl.wg,
+			ts:         ts,
+			id:         id,
+			stmts:      make(map[uint64]statement),
+		})
+	}
+	sort.Slice(ctl.workers, func(i, j int) bool { return ctl.workers[i].ts < ctl.workers[j].ts })
+	if !ctl.DryRun {
+		ctl.MySQLConfig, err = mysql.ParseDSN(target)
+		if err != nil {
+			return nil, err
 		}
 	}
-	return sc.Err()
+	return ctl, nil
+}
+
+func (pc *playControl) Play(ctx context.Context) {
+	pc.PlayStartTime = time.Now().UnixNano() / int64(time.Millisecond)
+	if len(pc.workers) > 0 {
+		pc.OrigStartTime = pc.workers[0].ts
+	}
+	for _, worker := range pc.workers {
+		worker.playConfig = pc.playConfig
+		d := worker.WaitTime(worker.ts)
+		if d > 0 {
+			<-time.After(d)
+		}
+		pc.wg.Add(1)
+		go worker.start(ctx)
+	}
+	pc.wg.Wait()
+	return
 }
 
 type statement struct {
@@ -284,55 +299,69 @@ type statement struct {
 }
 
 type playWorker struct {
+	playConfig
+
+	src string
 	log *zap.Logger
-	cfg *mysql.Config
+	wg  *sync.WaitGroup
 
-	wg *sync.WaitGroup
-	ch chan event.MySQLEvent
-
-	id      uint64
-	schema  string
-	params  []interface{}
-	timeout time.Duration
+	ts     int64
+	id     uint64
+	schema string
+	params []interface{}
 
 	pool  *sql.DB
 	conn  *sql.Conn
 	stmts map[uint64]statement
 }
 
-func (pw *playWorker) push(e event.MySQLEvent) {
-	if len(e.Params) > 0 {
-		params := make([]interface{}, len(e.Params))
-		copy(params, e.Params)
-		e.Params = params
-	}
-	pw.ch <- e
-}
-
-func (pw *playWorker) stop() {
-	close(pw.ch)
-}
-
 func (pw *playWorker) start(ctx context.Context) {
 	defer pw.wg.Done()
-	var (
-		e   event.MySQLEvent
-		err error
-		ok  bool
-	)
-	pw.log.Info("new connection")
-	for {
-		select {
-		case e, ok = <-pw.ch:
-			if !ok {
-				pw.log.Debug("exit normally")
-				return
-			}
-		case <-ctx.Done():
-			pw.log.Debug("exit due to context done")
+
+	e := event.MySQLEvent{Params: []interface{}{}}
+	f, err := os.Open(pw.src)
+	if err != nil {
+		pw.log.Error("failed to open source file of the stream", zap.Error(err))
+		return
+	}
+	defer func() {
+		f.Close()
+		pw.quit(false)
+	}()
+	in := bufio.NewScanner(f)
+	if pw.MaxLineSize > 0 {
+		buf := make([]byte, 0, 4096)
+		in.Buffer(buf, pw.MaxLineSize)
+	}
+	for in.Scan() {
+		_, err = event.ScanEvent(in.Text(), 0, e.Reset(e.Params[:0]))
+		if err != nil {
+			pw.log.Error("failed to scan event", zap.Error(err))
 			return
 		}
-		if pw.log.Core().Enabled(zap.DebugLevel) {
+
+		if d := pw.WaitTime(e.Time); d > 0 {
+			stats.Add(stats.ConnWaiting, 1)
+			select {
+			case <-ctx.Done():
+				stats.Add(stats.ConnWaiting, -1)
+				pw.log.Debug("exit due to context done")
+				return
+			case <-time.After(d):
+				stats.Add(stats.ConnWaiting, -1)
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				pw.log.Debug("exit due to context done")
+				return
+			default:
+			}
+		}
+		if pw.DryRun {
+			pw.log.Info(e.String())
+			continue
+		} else if pw.log.Core().Enabled(zap.DebugLevel) {
 			pw.log.Debug(e.String())
 		}
 
@@ -355,8 +384,8 @@ func (pw *playWorker) start(ctx context.Context) {
 			continue
 		}
 		if err != nil {
-			if connErr := errors.Unwrap(err); connErr == sql.ErrConnDone || connErr == mysql.ErrInvalidConn || connErr == context.DeadlineExceeded {
-				pw.log.Warn("reconnect after "+e.String(), zap.String("cause", connErr.Error()))
+			if sqlErr := errors.Unwrap(err); sqlErr == context.DeadlineExceeded || sqlErr == sql.ErrConnDone || sqlErr == mysql.ErrInvalidConn {
+				pw.log.Warn("reconnect after "+e.String(), zap.String("cause", sqlErr.Error()))
 				pw.quit(true)
 				err = pw.handshake(ctx, pw.schema)
 				if err != nil {
@@ -369,13 +398,17 @@ func (pw *playWorker) start(ctx context.Context) {
 	}
 }
 
-func (pw *playWorker) handshake(ctx context.Context, schema string) error {
-	cfg := pw.cfg
+func (pw *playWorker) open(schema string) (*sql.DB, error) {
+	cfg := pw.MySQLConfig
 	if len(schema) > 0 && cfg.DBName != schema {
 		cfg = cfg.Clone()
 		cfg.DBName = schema
 	}
-	pool, err := sql.Open("mysql", cfg.FormatDSN())
+	return sql.Open("mysql", cfg.FormatDSN())
+}
+
+func (pw *playWorker) handshake(ctx context.Context, schema string) error {
+	pool, err := pw.open(schema)
 	if err != nil {
 		return err
 	}
@@ -413,13 +446,15 @@ func (pw *playWorker) execute(ctx context.Context, query string) error {
 	if err != nil {
 		return err
 	}
-	if pw.timeout > 0 {
+	if pw.QueryTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, pw.timeout)
+		ctx, cancel = context.WithTimeout(ctx, pw.QueryTimeout)
 		defer cancel()
 	}
 	stats.Add(stats.Queries, 1)
+	stats.Add(stats.ConnRunning, 1)
 	_, err = conn.ExecContext(ctx, query)
+	stats.Add(stats.ConnRunning, -1)
 	if err != nil {
 		stats.Add(stats.FailedQueries, 1)
 		return errors.Trace(err)
@@ -454,13 +489,15 @@ func (pw *playWorker) stmtExecute(ctx context.Context, id uint64, params []inter
 	if err != nil {
 		return err
 	}
-	if pw.timeout > 0 {
+	if pw.QueryTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, pw.timeout)
+		ctx, cancel = context.WithTimeout(ctx, pw.QueryTimeout)
 		defer cancel()
 	}
 	stats.Add(stats.StmtExecutes, 1)
+	stats.Add(stats.ConnRunning, 1)
 	_, err = stmt.ExecContext(ctx, params...)
+	stats.Add(stats.ConnRunning, -1)
 	if err != nil {
 		stats.Add(stats.FailedStmtExecutes, 1)
 		return errors.Trace(err)
@@ -483,7 +520,7 @@ func (pw *playWorker) stmtClose(ctx context.Context, id uint64) {
 func (pw *playWorker) getConn(ctx context.Context) (*sql.Conn, error) {
 	var err error
 	if pw.pool == nil {
-		pw.pool, err = sql.Open("mysql", pw.cfg.FormatDSN())
+		pw.pool, err = pw.open(pw.schema)
 		if err != nil {
 			return nil, err
 		}

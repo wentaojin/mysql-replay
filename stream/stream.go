@@ -69,7 +69,7 @@ type FactoryOptions struct {
 	ForceStart    bool
 }
 
-func NewFactoryFromPacketHandler(factory func(ConnID) MySQLPacketHandler, opts FactoryOptions) reassembly.StreamFactory {
+func NewFactoryFromPacketHandler(factory func(ConnID) MySQLPacketHandler, opts FactoryOptions) *mysqlStreamFactory {
 	if factory == nil {
 		factory = defaultHandlerFactory
 	}
@@ -81,7 +81,11 @@ var _ reassembly.StreamFactory = &mysqlStreamFactory{}
 type mysqlStreamFactory struct {
 	new  func(key ConnID) MySQLPacketHandler
 	opts FactoryOptions
+
+	ts time.Time
 }
+
+func (f *mysqlStreamFactory) LastStreamTime() time.Time { return f.ts }
 
 func (f *mysqlStreamFactory) New(netFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, ac reassembly.AssemblerContext) reassembly.Stream {
 	conn := ConnID{netFlow, tcpFlow}
@@ -94,6 +98,9 @@ func (f *mysqlStreamFactory) New(netFlow, tcpFlow gopacket.Flow, tcp *layers.TCP
 				h.OnPacket(pkt)
 			}
 		}()
+	}
+	if ac != nil && f.ts.Sub(ac.GetCaptureInfo().Timestamp) < 0 {
+		f.ts = ac.GetCaptureInfo().Timestamp
 	}
 	stats.Add(stats.Streams, 1)
 	return &mysqlStream{
@@ -111,9 +118,13 @@ var _ reassembly.Stream = &mysqlStream{}
 type mysqlStream struct {
 	conn ConnID
 
-	log *zap.Logger
-	buf *bytes.Buffer
-	pkt *MySQLPacket
+	log  *zap.Logger
+	buf0 *bytes.Buffer
+	buf1 *bytes.Buffer
+	pkt0 *MySQLPacket
+	pkt1 *MySQLPacket
+	t0   time.Time
+	t1   time.Time
 
 	ch   chan MySQLPacket
 	done chan struct{}
@@ -133,57 +144,83 @@ func (s *mysqlStream) Accept(tcp *layers.TCP, ci gopacket.CaptureInfo, dir reass
 }
 
 func (s *mysqlStream) ReassembledSG(sg reassembly.ScatterGather, ac reassembly.AssemblerContext) {
-	if ac == nil {
-		s.log.Info("skip nil assembler context")
-		return
-	}
 	length, _ := sg.Lengths()
 	if length == 0 {
 		return
 	}
 
 	data := sg.Fetch(length)
-	dir, _, _, _ := sg.Info()
+	dir, _, _, skip := sg.Info()
+	buf := s.getBuf(dir)
+	ts := s.getTime(dir)
 
-	if s.buf == nil {
-		buf := bytes.NewBuffer(data)
-		seq := lookupPacketSeq(buf)
-		if seq != 0 {
-			s.log.Info("drop init packet with non-zero seq", zap.String("data", hex.EncodeToString(data)))
-			return
+	if ac != nil {
+		t := ac.GetCaptureInfo().Timestamp
+		if ts.Sub(t) < 0 {
+			s.setTime(dir, t)
+			ts = t
 		}
-		s.buf = buf
-	} else {
-		s.buf.Write(data)
 	}
 
-	for s.buf.Len() > 0 {
-		pkt := s.pkt
+	if skip < 0 {
+		s.log.Info("trim duplicated data", zap.String("dir", dir.String()), zap.Int("size", -skip))
+		data = data[-skip:]
+	}
+
+	if buf == nil {
+		buf = bytes.NewBuffer(data)
+		if seq := lookupPacketSeq(buf); s.getBuf(!dir) == nil && seq != 0 {
+			s.log.Info("drop init packet with non-zero seq",
+				zap.String("dir", dir.String()), zap.String("data", formatData(data)))
+			return
+		}
+	} else {
+		if skip > 0 {
+			s.log.Warn("fill skipped data", zap.String("dir", dir.String()), zap.Int("size", skip))
+			buf.Grow(skip)
+			buf.Write(make([]byte, skip))
+		}
+		buf.Write(data)
+	}
+	s.setBuf(dir, buf)
+
+	cnt := 0
+	for buf.Len() > 0 {
+		pkt := s.getPkt(dir)
 		if pkt == nil {
 			pkt = &MySQLPacket{
 				Conn: s.conn,
-				Time: ac.GetCaptureInfo().Timestamp,
+				Time: ts,
 				Dir:  dir,
-				Len:  lookupPacketLen(s.buf),
-				Seq:  lookupPacketSeq(s.buf),
+				Len:  lookupPacketLen(buf),
+				Seq:  lookupPacketSeq(buf),
 			}
 		}
-		if pkt.Seq == -1 || s.buf.Len() < pkt.Len+4 {
+		if pkt.Seq == -1 || buf.Len() < pkt.Len+4 {
 			s.log.Debug("wait for more packet data", zap.String("dir", dir.String()))
-			if s.pkt == nil && pkt.Seq >= 0 {
-				s.pkt = pkt
+			if s.getPkt(dir) == nil && pkt.Seq >= 0 {
+				s.setPkt(dir, pkt)
+			}
+			if ac == nil && cnt > 0 {
+				s.log.Info("fallback to last seen time",
+					zap.String("dir", dir.String()), zap.Int("packets", cnt), zap.Time("time", ts))
 			}
 			return
 		}
 		pkt.Data = make([]byte, pkt.Len)
-		copy(pkt.Data, s.buf.Next(pkt.Len + 4)[4:])
+		copy(pkt.Data, buf.Next(pkt.Len + 4)[4:])
+		cnt += 1
 		stats.Add(stats.Packets, 1)
 		if s.opts.Synchronized {
 			s.h.OnPacket(*pkt)
 		} else {
 			s.ch <- *pkt
 		}
-		s.pkt = nil
+		s.setPkt(dir, nil)
+	}
+	if ac == nil && cnt > 0 {
+		s.log.Info("fallback to last seen time",
+			zap.String("dir", dir.String()), zap.Int("packets", cnt), zap.Time("time", ts))
 	}
 }
 
@@ -194,7 +231,55 @@ func (s *mysqlStream) ReassemblyComplete(ac reassembly.AssemblerContext) bool {
 	}
 	s.h.OnClose()
 	stats.Add(stats.Streams, -1)
-	return false
+	return true
+}
+
+func (s *mysqlStream) getBuf(dir reassembly.TCPFlowDirection) *bytes.Buffer {
+	if dir == reassembly.TCPDirClientToServer {
+		return s.buf0
+	} else {
+		return s.buf1
+	}
+}
+
+func (s *mysqlStream) setBuf(dir reassembly.TCPFlowDirection, buf *bytes.Buffer) {
+	if dir == reassembly.TCPDirClientToServer {
+		s.buf0 = buf
+	} else {
+		s.buf1 = buf
+	}
+}
+
+func (s *mysqlStream) getPkt(dir reassembly.TCPFlowDirection) *MySQLPacket {
+	if dir == reassembly.TCPDirClientToServer {
+		return s.pkt0
+	} else {
+		return s.pkt1
+	}
+}
+
+func (s *mysqlStream) setPkt(dir reassembly.TCPFlowDirection, pkt *MySQLPacket) {
+	if dir == reassembly.TCPDirClientToServer {
+		s.pkt0 = pkt
+	} else {
+		s.pkt1 = pkt
+	}
+}
+
+func (s *mysqlStream) getTime(dir reassembly.TCPFlowDirection) time.Time {
+	if dir == reassembly.TCPDirClientToServer {
+		return s.t0
+	} else {
+		return s.t1
+	}
+}
+
+func (s *mysqlStream) setTime(dir reassembly.TCPFlowDirection, t time.Time) {
+	if dir == reassembly.TCPDirClientToServer {
+		s.t0 = t
+	} else {
+		s.t1 = t
+	}
 }
 
 func lookupPacketLen(buf *bytes.Buffer) int {
@@ -210,6 +295,14 @@ func lookupPacketSeq(buf *bytes.Buffer) int {
 		return -1
 	}
 	return int(buf.Bytes()[3])
+}
+
+func formatData(data []byte) string {
+	if len(data) > 500 {
+		return string(data[:297]) + "..." + string(data[len(data)-200:])
+	} else {
+		return string(data)
+	}
 }
 
 const (

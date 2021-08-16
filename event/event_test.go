@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
 	"reflect"
 	"strconv"
 	"testing"
@@ -27,59 +26,50 @@ func TestEventCodec(t *testing.T) {
 	}{
 		{MySQLEvent{
 			Time: 0,
-			Conn: 0,
 			Type: EventHandshake,
-		}, "0\t0\t0\t\"\"", true},
+		}, "0\t0\t\"\"", true},
 		{MySQLEvent{
 			Time: 1,
-			Conn: 1,
 			Type: EventHandshake,
 			DB:   "test",
-		}, "1\t1\t0\t\"test\"", true},
+		}, "1\t0\t\"test\"", true},
 		{MySQLEvent{
 			Time: 2,
-			Conn: 2,
 			Type: EventQuit,
-		}, "2\t2\t1", true},
+		}, "2\t1", true},
 		{MySQLEvent{
 			Time:  3,
-			Conn:  3,
 			Type:  EventQuery,
 			Query: "select * from t where id = 1",
-		}, "3\t3\t2\t\"select * from t where id = 1\"", true},
+		}, "3\t2\t\"select * from t where id = 1\"", true},
 		{MySQLEvent{
 			Time:   4,
-			Conn:   4,
 			Type:   EventStmtPrepare,
 			StmtID: 1,
 			Query:  "select * from t where id = ?",
-		}, "4\t4\t3\t1\t\"select * from t where id = ?\"", true},
+		}, "4\t3\t1\t\"select * from t where id = ?\"", true},
 		{MySQLEvent{
 			Time:   5,
-			Conn:   4,
 			Type:   EventStmtExecute,
 			StmtID: 1,
 			Params: []interface{}{int64(1)},
-		}, "5\t4\t4\t1\t[i\t1", true},
+		}, "5\t4\t1\t[i\t1", true},
 		{MySQLEvent{
 			Time:   6,
-			Conn:   4,
 			Type:   EventStmtExecute,
 			StmtID: 1,
 			Params: []interface{}{},
-		}, "6\t4\t4\t1\t[", true},
+		}, "6\t4\t1\t[", true},
 		{MySQLEvent{
 			Time:   7,
-			Conn:   4,
 			Type:   EventStmtExecute,
 			StmtID: 1,
-		}, "7\t4\t4\t1\t[", true},
+		}, "7\t4\t1\t[", true},
 		{MySQLEvent{
 			Time:   8,
-			Conn:   4,
 			Type:   EventStmtClose,
 			StmtID: 1,
-		}, "8\t4\t5\t1", true},
+		}, "8\t5\t1", true},
 	} {
 		t.Run(t.Name()+strconv.Itoa(i), func(t *testing.T) {
 			buf = buf[:0]
@@ -160,7 +150,6 @@ func TestStmtParamsCodec(t *testing.T) {
 func BenchmarkScanEventQuery(b *testing.B) {
 	raw, _ := AppendEvent(make([]byte, 0, 4096), MySQLEvent{
 		Time:  time.Now().UnixNano() / int64(time.Millisecond),
-		Conn:  rand.Uint64(),
 		Type:  EventQuery,
 		Query: "INSERT INTO sbtest1 (id, k, c, pad) VALUES (0, 4855, '26859969401-32022045049-36802759049-57581620716-25566497596-81077101714-43815129390-50670555126-74015418324-70781354462', '78370658245-88835010182-54392836759-10863319425-91771424474')",
 	})
@@ -174,7 +163,6 @@ func BenchmarkScanEventQuery(b *testing.B) {
 func BenchmarkScanEventQueryJson(b *testing.B) {
 	raw, _ := json.Marshal(MySQLEvent{
 		Time:  time.Now().UnixNano() / int64(time.Millisecond),
-		Conn:  rand.Uint64(),
 		Type:  EventQuery,
 		Query: "INSERT INTO sbtest1 (id, k, c, pad) VALUES (0, 4855, '26859969401-32022045049-36802759049-57581620716-25566497596-81077101714-43815129390-50670555126-74015418324-70781354462', '78370658245-88835010182-54392836759-10863319425-91771424474')",
 	})
@@ -187,7 +175,6 @@ func BenchmarkScanEventQueryJson(b *testing.B) {
 func BenchmarkScanEventStmtExecute(b *testing.B) {
 	raw, _ := AppendEvent(make([]byte, 0, 4096), MySQLEvent{
 		Time:   time.Now().UnixNano() / int64(time.Millisecond),
-		Conn:   rand.Uint64(),
 		Type:   EventStmtExecute,
 		StmtID: 1,
 		Params: []interface{}{
@@ -210,7 +197,6 @@ func BenchmarkScanEventStmtExecute(b *testing.B) {
 func BenchmarkScanEventStmtExecuteJson(b *testing.B) {
 	raw, _ := json.Marshal(MySQLEvent{
 		Time:   time.Now().UnixNano() / int64(time.Millisecond),
-		Conn:   rand.Uint64(),
 		Type:   EventStmtExecute,
 		StmtID: 1,
 		Params: []interface{}{

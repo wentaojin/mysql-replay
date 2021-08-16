@@ -9,14 +9,18 @@ import (
 	"github.com/zyguan/mysql-replay/event"
 )
 
-func NewFactoryFromEventHandler(factory func(ConnID) MySQLEventHandler, opts FactoryOptions) reassembly.StreamFactory {
+func NewFactoryFromEventHandler(factory func(ConnID) MySQLEventHandler, opts FactoryOptions) *mysqlStreamFactory {
 	f := defaultHandlerFactory
 	if factory != nil {
 		f = func(conn ConnID) MySQLPacketHandler {
+			impl := factory(conn)
+			if impl == nil {
+				return RejectConn(conn)
+			}
 			return &eventHandler{
 				fsm:  NewMySQLFSM(conn.Logger("mysql-stream")),
 				conn: conn,
-				impl: factory(conn),
+				impl: impl,
 			}
 		}
 	}
@@ -43,7 +47,7 @@ func (h *eventHandler) OnPacket(pkt MySQLPacket) {
 	if !h.fsm.Ready() || !h.fsm.Changed() {
 		return
 	}
-	e := event.MySQLEvent{Time: pkt.Time.UnixNano() / int64(time.Millisecond), Conn: h.conn.Hash()}
+	e := event.MySQLEvent{Time: pkt.Time.UnixNano() / int64(time.Millisecond)}
 	switch h.fsm.State() {
 	case StateComQuery:
 		e.Type = event.EventQuery

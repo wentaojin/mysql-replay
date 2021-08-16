@@ -18,7 +18,6 @@ const (
 
 type MySQLEvent struct {
 	Time   int64         `json:"time"`
-	Conn   uint64        `json:"conn"`
 	Type   uint64        `json:"type"`
 	StmtID uint64        `json:"stmtID,omitempty"`
 	Params []interface{} `json:"params,omitempty"`
@@ -28,7 +27,6 @@ type MySQLEvent struct {
 
 func (event *MySQLEvent) Reset(params []interface{}) *MySQLEvent {
 	event.Time = 0
-	event.Conn = 0
 	event.Type = 0
 	event.StmtID = 0
 	event.Params = params
@@ -40,20 +38,27 @@ func (event *MySQLEvent) Reset(params []interface{}) *MySQLEvent {
 func (event *MySQLEvent) String() string {
 	switch event.Type {
 	case EventQuery:
-		return fmt.Sprintf("%016x@%d execute {query:%q}", event.Conn, event.Time, event.Query)
+		return fmt.Sprintf("execute {query:%q} @ %d", formatQuery(event.Query), event.Time)
 	case EventStmtExecute:
-		return fmt.Sprintf("%016x@%d execute stmt {id:%d,params:%v}", event.Conn, event.Time, event.StmtID, event.Params)
+		return fmt.Sprintf("execute stmt {id:%d,params:%v} @%d", event.StmtID, event.Params, event.Time)
 	case EventStmtPrepare:
-		return fmt.Sprintf("%016x@%d prepare stmt {id:%d,query:%q}", event.Conn, event.Time, event.StmtID, event.Query)
+		return fmt.Sprintf("prepare stmt {id:%d,query:%q} @%d", event.StmtID, formatQuery(event.Query), event.Time)
 	case EventStmtClose:
-		return fmt.Sprintf("%016x@%d close stmt {id:%d}", event.Conn, event.Time, event.StmtID)
+		return fmt.Sprintf("close stmt {id:%d} @%d", event.StmtID, event.Time)
 	case EventHandshake:
-		return fmt.Sprintf("%016x@%d connect {db:%q}", event.Conn, event.Time, event.DB)
+		return fmt.Sprintf("connect {db:%q} @%d", event.DB, event.Time)
 	case EventQuit:
-		return fmt.Sprintf("%016x@%d quit", event.Conn, event.Time)
+		return fmt.Sprintf("quit @%d", event.Time)
 	default:
-		return fmt.Sprintf("%016x@%d unknown event type (%v)", event.Conn, event.Time, event.Type)
+		return fmt.Sprintf("unknown event {type:%v} @%d", event.Type, event.Time)
 	}
+}
+
+func formatQuery(query string) string {
+	if len(query) > 1024 {
+		query = query[:700] + "..." + query[len(query)-300:]
+	}
+	return query
 }
 
 const (
@@ -72,8 +77,6 @@ const (
 func AppendEvent(buf []byte, event MySQLEvent) ([]byte, error) {
 	var err error
 	buf = strconv.AppendInt(buf, event.Time, 10)
-	buf = append(buf, sep)
-	buf = strconv.AppendUint(buf, event.Conn, 16)
 	buf = append(buf, sep)
 	buf = strconv.AppendUint(buf, event.Type, 10)
 	switch event.Type {
@@ -162,16 +165,6 @@ func ScanEvent(s string, pos int, event *MySQLEvent) (int, error) {
 	event.Time, err = strconv.ParseInt(s[pos:posNext], 10, 64)
 	if err != nil {
 		return pos, fmt.Errorf("scan time of event from (%s): %v", s[pos:posNext], err)
-	}
-	pos = posNext + 1
-	// conn
-	if len(s) < pos+1 {
-		return pos, fmt.Errorf("scan conn of event from an empty string")
-	}
-	posNext = nextSep(s, pos)
-	event.Conn, err = strconv.ParseUint(s[pos:posNext], 16, 64)
-	if err != nil {
-		return pos, fmt.Errorf("scan conn of event from (%s): %v", s[pos:posNext], err)
 	}
 	pos = posNext + 1
 	// type

@@ -10,6 +10,8 @@ const (
 	Queries      = "queries"
 	Streams      = "streams"
 	Connections  = "connections"
+	ConnWaiting  = "conn.waiting"
+	ConnRunning  = "conn.running"
 	StmtExecutes = "stmt.executes"
 	StmtPrepares = "stmt.prepares"
 
@@ -30,7 +32,10 @@ var (
 	nErrStmtExecutes int64
 	nErrStmtPrepares int64
 
-	metrics = []string{Packets, Queries, StmtExecutes, StmtPrepares, Streams, Connections, FailedQueries, FailedStmtExecutes, FailedStmtPrepares}
+	nRunningConns int64
+	nWaitingConns int64
+
+	metrics = []string{Packets, Queries, StmtExecutes, StmtPrepares, Streams, Connections, FailedQueries, FailedStmtExecutes, FailedStmtPrepares, ConnWaiting, ConnRunning}
 	others  = make(map[string]int64)
 	lock    sync.RWMutex
 )
@@ -39,6 +44,10 @@ func Add(name string, delta int64) int64 {
 	switch name {
 	case Packets:
 		return atomic.AddInt64(&nPackets, delta)
+	case ConnRunning:
+		return atomic.AddInt64(&nRunningConns, delta)
+	case ConnWaiting:
+		return atomic.AddInt64(&nWaitingConns, delta)
 	case Queries:
 		return atomic.AddInt64(&nQueries, delta)
 	case StmtExecutes:
@@ -67,6 +76,10 @@ func Get(name string) int64 {
 	switch name {
 	case Packets:
 		return atomic.LoadInt64(&nPackets)
+	case ConnRunning:
+		return atomic.LoadInt64(&nRunningConns)
+	case ConnWaiting:
+		return atomic.LoadInt64(&nWaitingConns)
 	case Queries:
 		return atomic.LoadInt64(&nQueries)
 	case StmtExecutes:
