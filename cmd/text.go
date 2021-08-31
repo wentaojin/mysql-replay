@@ -29,8 +29,9 @@ import (
 
 func NewTextDumpCommand() *cobra.Command {
 	var (
-		options = stream.FactoryOptions{Synchronized: true}
-		output  string
+		options        = stream.FactoryOptions{Synchronized: true}
+		output         string
+		reportInterval time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "dump",
@@ -79,6 +80,26 @@ func NewTextDumpCommand() *cobra.Command {
 				return nil
 			}
 
+			startTime := time.Now()
+			go func() {
+				ticker := time.NewTicker(reportInterval)
+				defer ticker.Stop()
+				var (
+					prvDataIn int64
+					curDataIn int64
+				)
+				for {
+					prvDataIn = curDataIn
+					<-ticker.C
+					curDataIn = stats.Get(stats.DataIn)
+					zap.L().Info("stats",
+						zap.Int64("speed", int64(float64(curDataIn-prvDataIn)*float64(time.Second)/float64(reportInterval))),
+						zap.Int64(stats.DataIn, curDataIn),
+						zap.Int64(stats.DataOut, stats.Get(stats.DataOut)),
+						zap.Int64(stats.Packets, stats.Get(stats.Packets)))
+				}
+			}()
+
 			for _, in := range args {
 				zap.L().Info("processing " + in)
 				err := handle(in)
@@ -89,11 +110,19 @@ func NewTextDumpCommand() *cobra.Command {
 			}
 			assembler.FlushAll()
 
+			zap.L().Info("done",
+				zap.Int64("speed", int64(float64(stats.Get(stats.DataIn))*float64(time.Second)/float64(time.Since(startTime)))),
+				zap.Int64(stats.DataIn, stats.Get(stats.DataIn)),
+				zap.Int64(stats.DataOut, stats.Get(stats.DataOut)),
+				zap.Int64(stats.Packets, stats.Get(stats.Packets)))
+
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&output, "output", "o", "", "output directory")
 	cmd.Flags().BoolVar(&options.ForceStart, "force-start", false, "accept streams even if no SYN have been seen")
+	cmd.Flags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
+
 	return cmd
 }
 
@@ -116,6 +145,7 @@ func (h *textDumpHandler) OnEvent(e event.MySQLEvent) {
 		h.log.Error("failed to dump event", zap.Any("value", e), zap.Error(err))
 		return
 	}
+	stats.Add(stats.DataOut, int64(len(h.buf))+1)
 	h.w.Write(h.buf)
 	h.w.WriteString("\n")
 	h.lst = e.Time

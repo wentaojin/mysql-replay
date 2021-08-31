@@ -211,6 +211,7 @@ func (s *mysqlStream) ReassembledSG(sg reassembly.ScatterGather, ac reassembly.A
 		copy(pkt.Data, buf.Next(pkt.Len + 4)[4:])
 		cnt += 1
 		stats.Add(stats.Packets, 1)
+		stats.Add(stats.DataIn, int64(pkt.Len)+4)
 		if s.opts.Synchronized {
 			s.h.OnPacket(*pkt)
 		} else {

@@ -14,6 +14,8 @@ const (
 	ConnRunning  = "conn.running"
 	StmtExecutes = "stmt.executes"
 	StmtPrepares = "stmt.prepares"
+	DataIn       = "data.in"
+	DataOut      = "data.out"
 
 	FailedQueries      = "err.queries"
 	FailedStmtExecutes = "err.stmt.executes"
@@ -27,6 +29,8 @@ var (
 	nConns        int64
 	nStmtExecutes int64
 	nStmtPrepares int64
+	nDataIn       int64
+	nDataOut      int64
 
 	nErrQueries      int64
 	nErrStmtExecutes int64
@@ -44,6 +48,10 @@ func Add(name string, delta int64) int64 {
 	switch name {
 	case Packets:
 		return atomic.AddInt64(&nPackets, delta)
+	case DataIn:
+		return atomic.AddInt64(&nDataIn, delta)
+	case DataOut:
+		return atomic.AddInt64(&nDataOut, delta)
 	case ConnRunning:
 		return atomic.AddInt64(&nRunningConns, delta)
 	case ConnWaiting:
@@ -76,6 +84,10 @@ func Get(name string) int64 {
 	switch name {
 	case Packets:
 		return atomic.LoadInt64(&nPackets)
+	case DataIn:
+		return atomic.LoadInt64(&nDataIn)
+	case DataOut:
+		return atomic.LoadInt64(&nDataOut)
 	case ConnRunning:
 		return atomic.LoadInt64(&nRunningConns)
 	case ConnWaiting:
