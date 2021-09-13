@@ -81,11 +81,7 @@ var _ reassembly.StreamFactory = &mysqlStreamFactory{}
 type mysqlStreamFactory struct {
 	new  func(key ConnID) MySQLPacketHandler
 	opts FactoryOptions
-
-	ts time.Time
 }
-
-func (f *mysqlStreamFactory) LastStreamTime() time.Time { return f.ts }
 
 func (f *mysqlStreamFactory) New(netFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, ac reassembly.AssemblerContext) reassembly.Stream {
 	conn := ConnID{netFlow, tcpFlow}
@@ -98,9 +94,6 @@ func (f *mysqlStreamFactory) New(netFlow, tcpFlow gopacket.Flow, tcp *layers.TCP
 				h.OnPacket(pkt)
 			}
 		}()
-	}
-	if ac != nil && f.ts.Sub(ac.GetCaptureInfo().Timestamp) < 0 {
-		f.ts = ac.GetCaptureInfo().Timestamp
 	}
 	stats.Add(stats.Streams, 1)
 	return &mysqlStream{
