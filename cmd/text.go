@@ -4,15 +4,19 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -174,13 +178,14 @@ func (h *textDumpHandler) OnClose() {
 
 func NewTextPlayCommand() *cobra.Command {
 	var (
+		agents         []string
 		config         playConfig
 		targetDSN      string
 		reportInterval time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "play",
-		Short: "Play mysql events from text files",
+		Short: "PlayLocal mysql events from text files",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var (
@@ -220,13 +225,14 @@ func NewTextPlayCommand() *cobra.Command {
 				}
 			}()
 
-			ctl.Play(context.Background())
+			ctl.Play(context.Background(), agents)
 			close(done)
 			loadFields()
 			ctl.log.Info("done", fields...)
 			return nil
 		},
 	}
+	cmd.Flags().StringSliceVar(&agents, "agents", []string{}, "agents list")
 	cmd.Flags().StringVar(&targetDSN, "target-dsn", "", "target dsn")
 	cmd.Flags().Float64Var(&config.Speed, "speed", 1, "speed ratio")
 	cmd.Flags().BoolVar(&config.DryRun, "dry-run", false, "dry run mode (just print events)")
@@ -279,7 +285,7 @@ func newPlayControl(cfg playConfig, input string, target string) (*playControl, 
 			continue
 		}
 		info := strings.Split(filepath.Base(file.Name()), ".")
-		if len(info) != 4 && info[3] != "tsv" {
+		if len(info) != 4 || info[3] != "tsv" {
 			continue
 		}
 		ts, err := strconv.ParseInt(info[0], 10, 64)
@@ -312,7 +318,7 @@ func newPlayControl(cfg playConfig, input string, target string) (*playControl, 
 	return ctl, nil
 }
 
-func (pc *playControl) Play(ctx context.Context) {
+func (pc *playControl) PlayLocal(ctx context.Context) {
 	pc.PlayStartTime = time.Now().UnixNano() / int64(time.Millisecond)
 	if len(pc.workers) > 0 {
 		pc.OrigStartTime = pc.workers[0].ts
@@ -324,10 +330,127 @@ func (pc *playControl) Play(ctx context.Context) {
 			<-time.After(d)
 		}
 		pc.wg.Add(1)
-		go worker.start(ctx)
+		go func(pw *playWorker) {
+			f, err := os.Open(pw.src)
+			if err != nil {
+				pw.log.Error("failed to open source file of the stream", zap.Error(err))
+				return
+			}
+			pw.start(ctx, f)
+		}(worker)
 	}
 	pc.wg.Wait()
 	return
+}
+
+func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
+	pc.PlayStartTime = time.Now().UnixNano() / int64(time.Millisecond)
+	if len(pc.workers) > 0 {
+		pc.OrigStartTime = pc.workers[0].ts
+	}
+	allSubmitted := int32(0)
+	name := fmt.Sprintf("job-%d-%d", pc.PlayStartTime, rand.Int63())
+
+	go func() {
+		defer atomic.StoreInt32(&allSubmitted, 1)
+		for i, worker := range pc.workers {
+			worker.playConfig = pc.playConfig
+			d := worker.WaitTime(worker.ts)
+			if d > 0 {
+				<-time.After(d)
+			}
+			agent := agents[i%len(agents)]
+			task := &playTask{worker: worker}
+			f, err := os.Open(worker.src)
+			if err != nil {
+				pc.log.Error("open session file", zap.Error(err))
+				continue
+			}
+			req, err := task.buildRequest(fmt.Sprintf("%s/%s", agent, name), f)
+			if err != nil {
+				pc.log.Error("build remote request", zap.Error(err))
+				continue
+			}
+			go func() {
+				logger := pc.log.With(zap.String("src", f.Name()), zap.String("url", req.URL.String()))
+				logger.Info("submit task")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					logger.Error("send remote request", zap.Error(err))
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					fields := []zap.Field{zap.Int("status", resp.StatusCode)}
+					if msg, err := ioutil.ReadAll(resp.Body); err == nil {
+						fields = append(fields, zap.String("body", string(msg)))
+					}
+					logger.Error("unexpected response", fields...)
+				}
+			}()
+		}
+	}()
+
+	ticker := time.NewTicker(5 * time.Second)
+	for {
+		<-ticker.C
+		var (
+			total    = 0
+			finished = 0
+			counters = map[string]int64{}
+		)
+		for _, agent := range agents {
+			resp, err := http.Get(fmt.Sprintf("%s/%s", agent, name))
+			if err != nil {
+				pc.log.Error("query job status", zap.String("agent", agent), zap.Error(err))
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				fields := []zap.Field{zap.String("agent", agent), zap.Int("status", resp.StatusCode)}
+				if msg, err := ioutil.ReadAll(resp.Body); err == nil {
+					fields = append(fields, zap.String("body", string(msg)))
+				}
+				pc.log.Error("unexpected response", fields...)
+				continue
+			}
+			var status playJobStatus
+			err = json.NewDecoder(resp.Body).Decode(&status)
+			if err != nil {
+				pc.log.Error("decode response", zap.String("agent", agent), zap.Error(err))
+				continue
+			}
+			total += status.Total
+			finished += status.Finished
+			for _, name := range []string{
+				stats.Connections, stats.ConnRunning, stats.ConnWaiting,
+				stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
+				stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
+			} {
+				counters[name] += status.Stats[name]
+			}
+		}
+		for _, name := range []string{
+			stats.Connections, stats.ConnRunning, stats.ConnWaiting,
+			stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
+			stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
+		} {
+			stats.Add(name, counters[name]-stats.Get(name))
+		}
+		if atomic.LoadInt32(&allSubmitted) > 0 && total == finished {
+			break
+		}
+		//pc.log.Info("progress", zap.Int("total", total), zap.Int("finished", finished))
+	}
+	ticker.Stop()
+	return
+}
+
+func (pc *playControl) Play(ctx context.Context, agents []string) {
+	if len(agents) == 0 {
+		pc.PlayLocal(ctx)
+	} else {
+		pc.PlayRemote(ctx, agents)
+	}
 }
 
 type statement struct {
@@ -352,26 +475,20 @@ type playWorker struct {
 	stmts map[uint64]statement
 }
 
-func (pw *playWorker) start(ctx context.Context) {
-	defer pw.wg.Done()
-
-	e := event.MySQLEvent{Params: []interface{}{}}
-	f, err := os.Open(pw.src)
-	if err != nil {
-		pw.log.Error("failed to open source file of the stream", zap.Error(err))
-		return
-	}
+func (pw *playWorker) start(ctx context.Context, r io.ReadCloser) {
 	defer func() {
-		f.Close()
+		r.Close()
 		pw.quit(false)
+		pw.wg.Done()
 	}()
-	in := bufio.NewScanner(f)
+	e := event.MySQLEvent{Params: []interface{}{}}
+	in := bufio.NewScanner(r)
 	if pw.MaxLineSize > 0 {
 		buf := make([]byte, 0, 4096)
 		in.Buffer(buf, pw.MaxLineSize)
 	}
 	for in.Scan() {
-		_, err = event.ScanEvent(in.Text(), 0, e.Reset(e.Params[:0]))
+		_, err := event.ScanEvent(in.Text(), 0, e.Reset(e.Params[:0]))
 		if err != nil {
 			pw.log.Error("failed to scan event", zap.Error(err))
 			return
@@ -604,5 +721,6 @@ func NewTextCommand() *cobra.Command {
 	}
 	cmd.AddCommand(NewTextDumpCommand())
 	cmd.AddCommand(NewTextPlayCommand())
+	cmd.AddCommand(NewTextAgentCommand())
 	return cmd
 }
