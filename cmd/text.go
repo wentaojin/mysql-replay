@@ -198,7 +198,7 @@ func NewTextPlayCommand() *cobra.Command {
 				return err
 			}
 
-			fields := make([]zap.Field, 0, 7)
+			fields := make([]zap.Field, 0, 10)
 			loadFields := func() {
 				metrics := stats.Dump()
 				fields = fields[:0]
@@ -208,6 +208,9 @@ func NewTextPlayCommand() *cobra.Command {
 					stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
 				} {
 					fields = append(fields, zap.Int64(name, metrics[name]))
+				}
+				if lagging := stats.GetLagging(); lagging > 0 {
+					fields = append(fields, zap.Duration("lagging", stats.GetLagging()))
 				}
 			}
 
@@ -397,6 +400,7 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 		var (
 			total    = 0
 			finished = 0
+			lagging  = .0
 			counters = map[string]int64{}
 		)
 		for _, agent := range agents {
@@ -421,6 +425,9 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 			}
 			total += status.Total
 			finished += status.Finished
+			if lagging < status.Lagging {
+				lagging = status.Lagging
+			}
 			for _, name := range []string{
 				stats.Connections, stats.ConnRunning, stats.ConnWaiting,
 				stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
@@ -429,6 +436,7 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 				counters[name] += status.Stats[name]
 			}
 		}
+		stats.SetLagging(0, time.Duration(lagging*float64(time.Second)))
 		for _, name := range []string{
 			stats.Connections, stats.ConnRunning, stats.ConnWaiting,
 			stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
@@ -442,6 +450,7 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 		//pc.log.Info("progress", zap.Int("total", total), zap.Int("finished", finished))
 	}
 	ticker.Stop()
+	stats.SetLagging(0, 0)
 	return
 }
 
@@ -480,6 +489,7 @@ func (pw *playWorker) start(ctx context.Context, r io.ReadCloser) {
 		r.Close()
 		pw.quit(false)
 		pw.wg.Done()
+		stats.SetLagging(pw.id, 0)
 	}()
 	e := event.MySQLEvent{Params: []interface{}{}}
 	in := bufio.NewScanner(r)
@@ -487,6 +497,7 @@ func (pw *playWorker) start(ctx context.Context, r io.ReadCloser) {
 		buf := make([]byte, 0, 4096)
 		in.Buffer(buf, pw.MaxLineSize)
 	}
+	slow := false
 	for in.Scan() {
 		_, err := event.ScanEvent(in.Text(), 0, e.Reset(e.Params[:0]))
 		if err != nil {
@@ -504,6 +515,10 @@ func (pw *playWorker) start(ctx context.Context, r io.ReadCloser) {
 			case <-time.After(d):
 				stats.Add(stats.ConnWaiting, -1)
 			}
+			if slow {
+				stats.SetLagging(pw.id, 0)
+				slow = false
+			}
 		} else {
 			select {
 			case <-ctx.Done():
@@ -511,6 +526,8 @@ func (pw *playWorker) start(ctx context.Context, r io.ReadCloser) {
 				return
 			default:
 			}
+			stats.SetLagging(pw.id, -d)
+			slow = true
 		}
 		if pw.DryRun {
 			pw.log.Info(e.String())

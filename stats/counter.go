@@ -3,6 +3,7 @@ package stats
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -38,6 +39,8 @@ var (
 
 	nRunningConns int64
 	nWaitingConns int64
+
+	laggings sync.Map
 
 	metrics = []string{Packets, Queries, StmtExecutes, StmtPrepares, Streams, Connections, FailedQueries, FailedStmtExecutes, FailedStmtPrepares, ConnWaiting, ConnRunning}
 	others  = make(map[string]int64)
@@ -126,4 +129,23 @@ func Dump() map[string]int64 {
 	}
 	lock.RUnlock()
 	return out
+}
+
+func SetLagging(c uint64, d time.Duration) {
+	if d <= 0 {
+		laggings.Delete(c)
+	} else {
+		laggings.Store(c, d)
+	}
+}
+
+func GetLagging() time.Duration {
+	var d time.Duration
+	laggings.Range(func(key, value interface{}) bool {
+		if dd, ok := value.(time.Duration); ok && dd > d {
+			d = dd
+		}
+		return true
+	})
+	return d
 }

@@ -160,6 +160,7 @@ func (task *playTask) run() {
 type playJobStatus struct {
 	Total    int              `json:"total"`
 	Finished int              `json:"finished"`
+	Lagging  float64          `json:"lagging"`
 	Stats    map[string]int64 `json:"stats"`
 }
 
@@ -207,6 +208,7 @@ func (store *playTaskStore) handleJobStatusQuery(w http.ResponseWriter, r *http.
 	}
 	store.lock.Unlock()
 	status.Stats = stats.Dump()
+	status.Lagging = float64(stats.GetLagging()) / float64(time.Second)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
 }
