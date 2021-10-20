@@ -157,6 +157,10 @@ func (s *mysqlStream) ReassembledSG(sg reassembly.ScatterGather, ac reassembly.A
 
 	if skip < 0 {
 		s.log.Info("trim duplicated data", zap.String("dir", dir.String()), zap.Int("size", -skip))
+		if -skip >= len(data) {
+			s.log.Warn("trim too much data", zap.String("dir", dir.String()), zap.Int("size", -skip), zap.Int("data-size", len(data)))
+			return
+		}
 		data = data[-skip:]
 	}
 
