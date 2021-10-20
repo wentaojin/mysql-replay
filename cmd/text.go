@@ -132,7 +132,7 @@ func NewTextDumpCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&output, "output", "o", "", "output directory")
 	cmd.Flags().BoolVar(&options.ForceStart, "force-start", false, "accept streams even if no SYN have been seen")
 	cmd.Flags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
-	cmd.Flags().DurationVar(&flushInterval, "flush-interval", time.Minute, "flush interval")
+	cmd.Flags().DurationVar(&flushInterval, "flush-interval", 3*time.Second, "flush interval")
 
 	return cmd
 }
