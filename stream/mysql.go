@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/gopacket/reassembly"
 	"github.com/pingcap/errors"
+	"github.com/zyguan/mysql-replay/stats"
 	"go.uber.org/zap"
 )
 
@@ -264,10 +265,22 @@ func (fsm *MySQLFSM) handleInitPacket() {
 	}
 	if fsm.isClientCommand(comQuery) {
 		fsm.handleComQueryNoLoad()
+		stats.Add(stats.ComQueryTotal, 1)
+		if fsm.state == StateUnknown {
+			stats.Add(stats.ComQueryError, 1)
+		}
 	} else if fsm.isClientCommand(comStmtExecute) {
 		fsm.handleComStmtExecuteNoLoad()
+		stats.Add(stats.ComExecuteTotal, 1)
+		if fsm.state == StateUnknown {
+			stats.Add(stats.ComExecuteError, 1)
+		}
 	} else if fsm.isClientCommand(comStmtPrepare) {
 		fsm.handleComStmtPrepareRequestNoLoad()
+		stats.Add(stats.ComPrepareTotal, 1)
+		if fsm.state == StateUnknown {
+			stats.Add(stats.ComPrepareError, 1)
+		}
 	} else if fsm.isClientCommand(comStmtClose) {
 		fsm.handleComStmtCloseNoLoad()
 	} else if fsm.isClientCommand(comQuit) {

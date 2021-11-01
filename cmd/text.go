@@ -107,6 +107,12 @@ func NewTextDumpCommand() *cobra.Command {
 						zap.Int64("speed", int64(float64(curDataIn-prvDataIn)*float64(time.Second)/float64(reportInterval))),
 						zap.Int64(stats.DataIn, curDataIn),
 						zap.Int64(stats.DataOut, stats.Get(stats.DataOut)),
+						zap.Int64(stats.ComQueryError, stats.Get(stats.ComQueryError)),
+						zap.Int64(stats.ComQueryTotal, stats.Get(stats.ComQueryTotal)),
+						zap.Int64(stats.ComExecuteError, stats.Get(stats.ComExecuteError)),
+						zap.Int64(stats.ComExecuteTotal, stats.Get(stats.ComExecuteTotal)),
+						zap.Int64(stats.ComPrepareError, stats.Get(stats.ComPrepareError)),
+						zap.Int64(stats.ComPrepareTotal, stats.Get(stats.ComPrepareTotal)),
 						zap.Int64(stats.Packets, stats.Get(stats.Packets)))
 				}
 			}()
@@ -124,6 +130,12 @@ func NewTextDumpCommand() *cobra.Command {
 				zap.Int64("speed", int64(float64(stats.Get(stats.DataIn))*float64(time.Second)/float64(time.Since(startTime)))),
 				zap.Int64(stats.DataIn, stats.Get(stats.DataIn)),
 				zap.Int64(stats.DataOut, stats.Get(stats.DataOut)),
+				zap.Int64(stats.ComQueryError, stats.Get(stats.ComQueryError)),
+				zap.Int64(stats.ComQueryTotal, stats.Get(stats.ComQueryTotal)),
+				zap.Int64(stats.ComExecuteError, stats.Get(stats.ComExecuteError)),
+				zap.Int64(stats.ComExecuteTotal, stats.Get(stats.ComExecuteTotal)),
+				zap.Int64(stats.ComPrepareError, stats.Get(stats.ComPrepareError)),
+				zap.Int64(stats.ComPrepareTotal, stats.Get(stats.ComPrepareTotal)),
 				zap.Int64(stats.Packets, stats.Get(stats.Packets)))
 
 			return nil

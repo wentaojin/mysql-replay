@@ -18,6 +18,13 @@ const (
 	DataIn       = "data.in"
 	DataOut      = "data.out"
 
+	ComQueryTotal   = "com.query.total"
+	ComQueryError   = "com.query.error"
+	ComPrepareTotal = "com.prepare.total"
+	ComPrepareError = "com.prepare.error"
+	ComExecuteTotal = "com.execute.total"
+	ComExecuteError = "com.execute.error"
+
 	FailedQueries      = "err.queries"
 	FailedStmtExecutes = "err.stmt.executes"
 	FailedStmtPrepares = "err.stmt.prepares"
@@ -33,6 +40,13 @@ var (
 	nDataIn       int64
 	nDataOut      int64
 
+	nComQueryTotal   int64
+	nComQueryError   int64
+	nComPrepareTotal int64
+	nComPrepareError int64
+	nComExecuteTotal int64
+	nComExecuteError int64
+
 	nErrQueries      int64
 	nErrStmtExecutes int64
 	nErrStmtPrepares int64
@@ -42,9 +56,13 @@ var (
 
 	laggings sync.Map
 
-	metrics = []string{Packets, Queries, StmtExecutes, StmtPrepares, Streams, Connections, FailedQueries, FailedStmtExecutes, FailedStmtPrepares, ConnWaiting, ConnRunning}
-	others  = make(map[string]int64)
-	lock    sync.RWMutex
+	metrics = []string{
+		Packets, Queries, StmtExecutes, StmtPrepares, Streams, Connections,
+		ComQueryTotal, ComPrepareTotal, ComExecuteTotal,
+		ComQueryError, ComPrepareError, ComExecuteError,
+		FailedQueries, FailedStmtExecutes, FailedStmtPrepares, ConnWaiting, ConnRunning}
+	others = make(map[string]int64)
+	lock   sync.RWMutex
 )
 
 func Add(name string, delta int64) int64 {
@@ -69,6 +87,18 @@ func Add(name string, delta int64) int64 {
 		return atomic.AddInt64(&nStreams, delta)
 	case Connections:
 		return atomic.AddInt64(&nConns, delta)
+	case ComQueryTotal:
+		return atomic.AddInt64(&nComQueryTotal, delta)
+	case ComQueryError:
+		return atomic.AddInt64(&nComQueryError, delta)
+	case ComExecuteTotal:
+		return atomic.AddInt64(&nComExecuteTotal, delta)
+	case ComExecuteError:
+		return atomic.AddInt64(&nComExecuteError, delta)
+	case ComPrepareTotal:
+		return atomic.AddInt64(&nComPrepareTotal, delta)
+	case ComPrepareError:
+		return atomic.AddInt64(&nComPrepareError, delta)
 	case FailedQueries:
 		return atomic.AddInt64(&nErrQueries, delta)
 	case FailedStmtExecutes:
@@ -105,6 +135,18 @@ func Get(name string) int64 {
 		return atomic.LoadInt64(&nStreams)
 	case Connections:
 		return atomic.LoadInt64(&nConns)
+	case ComQueryTotal:
+		return atomic.LoadInt64(&nComQueryTotal)
+	case ComQueryError:
+		return atomic.LoadInt64(&nComQueryError)
+	case ComExecuteTotal:
+		return atomic.LoadInt64(&nComExecuteTotal)
+	case ComExecuteError:
+		return atomic.LoadInt64(&nComExecuteError)
+	case ComPrepareTotal:
+		return atomic.LoadInt64(&nComPrepareTotal)
+	case ComPrepareError:
+		return atomic.LoadInt64(&nComPrepareError)
 	case FailedQueries:
 		return atomic.LoadInt64(&nErrQueries)
 	case FailedStmtExecutes:
