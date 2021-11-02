@@ -263,7 +263,7 @@ func (task *PlayTask) start(ctx context.Context, wg *sync.WaitGroup) {
 		}
 		if err != nil {
 			if sqlErr := errors.Unwrap(err); sqlErr == context.DeadlineExceeded || sqlErr == sql.ErrConnDone || sqlErr == mysql.ErrInvalidConn {
-				task.log.Warn("reconnect after "+e.String(), zap.String("cause", sqlErr.Error()))
+				task.log.Warn("reconnect after "+e.String(), zap.String("schema", task.schema), zap.String("cause", sqlErr.Error()))
 				task.quit(true)
 				err = task.handshake(ctx, task.schema)
 				if err != nil {
@@ -304,19 +304,21 @@ func (task *PlayTask) open(schema string) (*sql.DB, error) {
 		return nil, err
 	}
 	if len(schema) > 0 && cfg.DBName != schema {
-		cfg = cfg.Clone()
 		cfg.DBName = schema
+	}
+	if len(cfg.DBName) == 0 {
+		task.log.Warn("connect without empty schema", zap.String("dsn", cfg.FormatDSN()), zap.Stack("stack"))
 	}
 	return sql.Open("mysql", cfg.FormatDSN())
 }
 
 func (task *PlayTask) handshake(ctx context.Context, schema string) error {
+	task.schema = schema
 	pool, err := task.open(schema)
 	if err != nil {
 		return err
 	}
 	task.pool = pool
-	task.schema = schema
 	_, err = task.getConn(ctx)
 	return err
 }
