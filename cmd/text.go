@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"mime/multipart"
@@ -47,6 +48,16 @@ func NewTextDumpCommand() *cobra.Command {
 				os.MkdirAll(output, 0755)
 			}
 
+			var (
+				lock     sync.Mutex
+				outFiles = make(map[string][]*textFileInfo)
+				collect  = func(info *textFileInfo) {
+					lock.Lock()
+					outFiles[info.id] = append(outFiles[info.id], info)
+					lock.Unlock()
+				}
+			)
+
 			factory := stream.NewFactoryFromEventHandler(func(conn stream.ConnID) stream.MySQLEventHandler {
 				log := conn.Logger("dump")
 				out, err := os.CreateTemp(output, "."+conn.HashStr()+".*")
@@ -55,11 +66,12 @@ func NewTextDumpCommand() *cobra.Command {
 					return nil
 				}
 				return &textDumpHandler{
-					conn: conn,
-					buf:  make([]byte, 0, 4096),
-					log:  log,
-					out:  out,
-					w:    bufio.NewWriterSize(out, 1048576),
+					conn:    conn,
+					buf:     make([]byte, 0, 4096),
+					log:     log,
+					out:     out,
+					w:       bufio.NewWriterSize(out, 1048576),
+					collect: collect,
 				}
 			}, options)
 			pool := reassembly.NewStreamPool(factory)
@@ -135,6 +147,13 @@ func NewTextDumpCommand() *cobra.Command {
 				zap.Int64(stats.ComPrepareTotal, stats.Get(stats.ComPrepareTotal)),
 				zap.Int64(stats.Packets, stats.Get(stats.Packets)))
 
+			for id, files := range outFiles {
+				err := mergeTextOutFiles(files)
+				if err != nil {
+					zap.L().Error("merge files", zap.String("session", id), zap.Error(err))
+				}
+			}
+
 			return nil
 		},
 	}
@@ -146,6 +165,56 @@ func NewTextDumpCommand() *cobra.Command {
 	return cmd
 }
 
+type textFileInfo struct {
+	id   string
+	path string
+	fst  int64
+	lst  int64
+}
+
+func mergeTextOutFiles(files []*textFileInfo) error {
+	if len(files) <= 1 {
+		return nil
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].fst < files[j].fst })
+	for i := 0; i+1 < len(files); i++ {
+		if files[i].id != files[i+1].id {
+			return errors.Errorf("cannot merge files with different session id: [%s, %s]", files[i].id, files[i+1].id)
+		}
+		if files[i].lst > files[i+1].fst {
+			return errors.Errorf("cannot merge files with overlap: [%s, %s]", files[i].path, files[i+1].path)
+		}
+	}
+	mergeDst := filepath.Join(
+		filepath.Dir(files[0].path),
+		fmt.Sprintf("%d.%d.%s.tsv", files[0].fst, files[len(files)-1].lst, files[0].id))
+	out, err := os.OpenFile(mergeDst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return errors.Annotate(err, "open file for merge")
+	}
+	defer out.Close()
+	mergedFiles := make([]string, 0, len(files))
+	for _, file := range files {
+		f, err := os.Open(file.path)
+		if err != nil {
+			zap.L().Error("failed to merge file", zap.String("path", file.path), zap.Error(err))
+			continue
+		}
+		_, err = io.Copy(out, f)
+		if err != nil {
+			zap.L().Error("an error occurred while copying", zap.String("path", file.path), zap.Error(err))
+		} else {
+			mergedFiles = append(mergedFiles, file.path)
+			os.Remove(file.path)
+		}
+		f.Close()
+	}
+	if len(mergedFiles) > 0 {
+		zap.L().Sugar().Infof("merge %v into %s", mergedFiles, mergeDst)
+	}
+	return nil
+}
+
 type textDumpHandler struct {
 	conn stream.ConnID
 	buf  []byte
@@ -155,6 +224,8 @@ type textDumpHandler struct {
 
 	fst int64
 	lst int64
+
+	collect func(*textFileInfo)
 }
 
 func (h *textDumpHandler) OnEvent(e event.MySQLEvent) {
@@ -181,7 +252,11 @@ func (h *textDumpHandler) OnClose() {
 	if h.fst == 0 {
 		os.Remove(path)
 	} else {
-		os.Rename(path, filepath.Join(filepath.Dir(path), fmt.Sprintf("%d.%d.%s.tsv", h.fst, h.lst, h.conn.HashStr())))
+		finalPath := filepath.Join(filepath.Dir(path), fmt.Sprintf("%d.%d.%s.tsv", h.fst, h.lst, h.conn.HashStr()))
+		os.Rename(path, finalPath)
+		if h.collect != nil {
+			h.collect(&textFileInfo{id: h.conn.HashStr(), path: finalPath, fst: h.fst, lst: h.lst})
+		}
 	}
 }
 
