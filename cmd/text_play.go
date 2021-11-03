@@ -307,7 +307,7 @@ func (task *PlayTask) open(schema string) (*sql.DB, error) {
 		cfg.DBName = schema
 	}
 	if len(cfg.DBName) == 0 {
-		task.log.Warn("connect without empty schema", zap.String("dsn", cfg.FormatDSN()), zap.Stack("stack"))
+		task.log.Info("connect with empty schema", zap.String("dsn", cfg.FormatDSN()), zap.Stack("stack"))
 	}
 	return sql.Open("mysql", cfg.FormatDSN())
 }
