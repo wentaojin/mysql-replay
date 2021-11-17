@@ -295,7 +295,7 @@ func NewTextPlayCommand() *cobra.Command {
 					fields = append(fields, zap.Int64(name, metrics[name]))
 				}
 				for name, count := range metrics {
-					if strings.HasPrefix(name, "mysql-errors") && count > 50 {
+					if count > 50 && strings.HasPrefix(name, "mysql-error") {
 						fields = append(fields, zap.Int64(name, count))
 					}
 				}
