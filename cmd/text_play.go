@@ -270,6 +270,17 @@ func (task *PlayTask) start(ctx context.Context, wg *sync.WaitGroup) {
 					task.log.Warn("reconnect error", zap.Error(err))
 				}
 			} else {
+				mysqlErr, ok := err.(*mysql.MySQLError)
+				if ok {
+					cnt := stats.Add("mysql-errors."+strconv.FormatUint(uint64(mysqlErr.Number), 10), 1)
+					if cnt > 50 && cnt%100 == 0 {
+						task.log.Warn("too many mysql errors",
+							zap.Int64("count", cnt),
+							zap.Uint16("code", mysqlErr.Number),
+							zap.String("message", mysqlErr.Message))
+						continue
+					}
+				}
 				task.log.Warn("failed to apply "+e.String(), zap.Error(err))
 			}
 		}

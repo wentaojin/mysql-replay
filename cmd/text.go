@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -293,6 +294,11 @@ func NewTextPlayCommand() *cobra.Command {
 				} {
 					fields = append(fields, zap.Int64(name, metrics[name]))
 				}
+				for name, count := range metrics {
+					if strings.HasPrefix(name, "mysql-errors") && count > 50 {
+						fields = append(fields, zap.Int64(name, count))
+					}
+				}
 				if lagging := stats.GetLagging(); lagging > 0 {
 					fields = append(fields, zap.Duration("lagging", stats.GetLagging()))
 				}
@@ -478,21 +484,13 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 			if lagging < status.Lagging {
 				lagging = status.Lagging
 			}
-			for _, name := range []string{
-				stats.Connections, stats.ConnRunning, stats.ConnWaiting,
-				stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
-				stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
-			} {
-				counters[name] += status.Stats[name]
+			for name, count := range status.Stats {
+				counters[name] += count
 			}
 		}
 		stats.SetLagging(0, time.Duration(lagging*float64(time.Second)))
-		for _, name := range []string{
-			stats.Connections, stats.ConnRunning, stats.ConnWaiting,
-			stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
-			stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
-		} {
-			stats.Add(name, counters[name]-stats.Get(name))
+		for name, count := range counters {
+			stats.Add(name, count-stats.Get(name))
 		}
 		if atomic.LoadInt32(&allSubmitted) > 0 && total == finished {
 			break
