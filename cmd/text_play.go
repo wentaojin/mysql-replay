@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,6 +86,9 @@ type PlayJob struct {
 	To           int64   `json:"to"`
 	Split        int64   `json:"split"`
 	Speed        float64 `json:"speed"`
+	FilterIn     string  `json:"filter-in"`
+	FilterOut    string  `json:"filter-out"`
+	Debug        bool    `json:"debug"`
 
 	Open func() (io.ReadCloser, error) `json:"-"`
 }
@@ -150,6 +154,7 @@ func (job *PlayJob) Start(ctx context.Context, wg *sync.WaitGroup) []*PlayTask {
 	}
 	for _, task := range tasks {
 		wg.Add(1)
+		task.init()
 		go task.start(ctx, wg)
 	}
 	return tasks
@@ -168,12 +173,44 @@ type PlayTask struct {
 
 	schema string
 
-	pool  *sql.DB
-	conn  *sql.Conn
-	stmts map[uint64]statement
+	pool   *sql.DB
+	conn   *sql.Conn
+	stmts  map[uint64]statement
+	filter func(string) bool
 }
 
-func (task *PlayTask) debug() bool { return task.Split <= 0 }
+func (task *PlayTask) debug() bool { return task.Debug || task.Split <= 0 }
+
+func (task *PlayTask) init() {
+	var (
+		patternIn  *regexp.Regexp
+		patternOut *regexp.Regexp
+		err        error
+	)
+	if len(task.FilterIn) > 0 {
+		patternIn, err = regexp.Compile(task.FilterIn)
+		if err != nil {
+			task.log.Warn("invalid filter-in regexp", zap.Error(err))
+		}
+	}
+	if len(task.FilterOut) > 0 {
+		patternOut, err = regexp.Compile(task.FilterOut)
+		if err != nil {
+			task.log.Warn("invalid filter-out regexp", zap.Error(err))
+		}
+	}
+	if patternIn != nil || patternOut != nil {
+		task.filter = func(query string) bool {
+			if patternIn != nil && patternIn.FindStringIndex(query) == nil {
+				return false
+			}
+			if patternOut != nil && patternOut.FindStringIndex(query) != nil {
+				return false
+			}
+			return true
+		}
+	}
+}
 
 func (task *PlayTask) start(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -191,6 +228,24 @@ func (task *PlayTask) start(ctx context.Context, wg *sync.WaitGroup) {
 	if task.MaxLineSize > 0 {
 		buf := make([]byte, 0, 4096)
 		in.Buffer(buf, int(task.MaxLineSize))
+	}
+	var debug func(event.MySQLEvent)
+	if task.debug() {
+		stmts := map[uint64]bool{}
+		debug = func(e event.MySQLEvent) {
+			if task.filter != nil && (len(e.Query) > 0 && !task.filter(e.Query) ||
+				e.StmtID > 0 && e.Type != event.EventStmtPrepare && !stmts[e.StmtID]) {
+				task.log.Info("skip " + e.String())
+				return
+			}
+			if e.Type == event.EventStmtPrepare {
+				stmts[e.StmtID] = true
+			}
+			if e.Type == event.EventStmtClose {
+				delete(stmts, e.StmtID)
+			}
+			task.log.Info(e.String())
+		}
 	}
 	startTime := time.Now().UnixNano() / int64(time.Millisecond)
 	slow := false
@@ -232,8 +287,8 @@ func (task *PlayTask) start(ctx context.Context, wg *sync.WaitGroup) {
 				slow = true
 			}
 		}
-		if task.debug() {
-			task.log.Info(e.String())
+		if debug != nil {
+			debug(e)
 			continue
 		} else if task.log.Core().Enabled(zap.DebugLevel) {
 			task.log.Debug(e.String())
@@ -366,6 +421,10 @@ func (task *PlayTask) quit(reconnect bool) {
 }
 
 func (task *PlayTask) execute(ctx context.Context, query string) error {
+	if task.filter != nil && !task.filter(query) {
+		stats.Add(stats.SkippedQueries, 1)
+		return nil
+	}
 	conn, err := task.getConn(ctx)
 	if err != nil {
 		return err
@@ -387,6 +446,10 @@ func (task *PlayTask) execute(ctx context.Context, query string) error {
 }
 
 func (task *PlayTask) stmtPrepare(ctx context.Context, id uint64, query string) error {
+	if task.filter != nil && !task.filter(query) {
+		stats.Add(stats.SkippedStmtPrepares, 1)
+		return nil
+	}
 	stmt := task.stmts[id]
 	stmt.query = query
 	if stmt.handle != nil {
@@ -411,6 +474,10 @@ func (task *PlayTask) stmtPrepare(ctx context.Context, id uint64, query string) 
 func (task *PlayTask) stmtExecute(ctx context.Context, id uint64, params []interface{}) error {
 	stmt, err := task.getStmt(ctx, id)
 	if err != nil {
+		if task.filter != nil && strings.HasPrefix(err.Error(), "no such statement") {
+			stats.Add(stats.SkippedStmtExecutes, 1)
+			return nil
+		}
 		return err
 	}
 	if task.QueryTimeout > 0 {

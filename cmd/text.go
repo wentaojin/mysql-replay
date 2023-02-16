@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"mime/multipart"
 	"net/http"
@@ -283,13 +282,14 @@ func NewTextPlayCommand() *cobra.Command {
 				return err
 			}
 
-			fields := make([]zap.Field, 0, 10)
+			fields := make([]zap.Field, 0, 16)
 			loadFields := func() {
 				metrics := stats.Dump()
 				fields = fields[:0]
 				for _, name := range []string{
 					stats.Connections, stats.ConnRunning, stats.ConnWaiting,
 					stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
+					stats.SkippedQueries, stats.SkippedStmtExecutes, stats.SkippedStmtPrepares,
 					stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
 				} {
 					fields = append(fields, zap.Int64(name, metrics[name]))
@@ -331,6 +331,8 @@ func NewTextPlayCommand() *cobra.Command {
 	cmd.Flags().Int64Var(&options.Split, "split", 1, "split a session into multiple parts and replay them concurrently")
 	cmd.Flags().BoolVar(&options.DryRun, "dry-run", false, "dry run mode (just print events)")
 	cmd.Flags().IntVar(&options.MaxLineSize, "max-line-size", 16777216, "max line size")
+	cmd.Flags().StringVar(&options.FilterIn, "filter-in", "", "filter in statements")
+	cmd.Flags().StringVar(&options.FilterOut, "filter-out", "", "filter out statements")
 	cmd.Flags().DurationVar(&options.QueryTimeout, "query-timeout", time.Minute, "timeout for a single query")
 	cmd.Flags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
 	return cmd
@@ -341,6 +343,8 @@ type playOptions struct {
 	Speed        float64
 	Split        int64
 	MaxLineSize  int
+	FilterIn     string
+	FilterOut    string
 	QueryTimeout time.Duration
 	MySQLConfig  *mysql.Config
 }
@@ -353,7 +357,7 @@ type playControl struct {
 }
 
 func newPlayControl(opts playOptions, input string, target string) (*playControl, error) {
-	files, err := ioutil.ReadDir(input)
+	files, err := os.ReadDir(input)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +376,9 @@ func newPlayControl(opts playOptions, input string, target string) (*playControl
 		job.QueryTimeout = int64(ctl.QueryTimeout / time.Millisecond)
 		job.Split = ctl.Split
 		job.Speed = ctl.Speed
+		job.FilterIn = ctl.FilterIn
+		job.FilterOut = ctl.FilterOut
+		job.Debug = ctl.DryRun
 		ctl.jobs = append(ctl.jobs, job)
 	}
 	sort.Slice(ctl.jobs, func(i, j int) bool { return ctl.jobs[i].From < ctl.jobs[j].From })
@@ -402,7 +409,6 @@ func (pc *playControl) PlayLocal(ctx context.Context) {
 		job.Start(ctx, &wg)
 	}
 	wg.Wait()
-	return
 }
 
 func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
@@ -441,7 +447,7 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 				defer resp.Body.Close()
 				if resp.StatusCode != http.StatusOK {
 					fields := []zap.Field{zap.Int("status", resp.StatusCode)}
-					if msg, err := ioutil.ReadAll(resp.Body); err == nil {
+					if msg, err := io.ReadAll(resp.Body); err == nil {
 						fields = append(fields, zap.String("body", string(msg)))
 					}
 					logger.Error("unexpected response", fields...)
@@ -467,7 +473,7 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 			}
 			if resp.StatusCode != http.StatusOK {
 				fields := []zap.Field{zap.String("agent", agent), zap.Int("status", resp.StatusCode)}
-				if msg, err := ioutil.ReadAll(resp.Body); err == nil {
+				if msg, err := io.ReadAll(resp.Body); err == nil {
 					fields = append(fields, zap.String("body", string(msg)))
 				}
 				pc.log.Error("unexpected response", fields...)
@@ -499,7 +505,6 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 	}
 	ticker.Stop()
 	stats.SetLagging(0, 0)
-	return
 }
 
 func (pc *playControl) Play(ctx context.Context, agents []string) {

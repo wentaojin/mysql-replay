@@ -25,6 +25,10 @@ const (
 	ComExecuteTotal = "com.execute.total"
 	ComExecuteError = "com.execute.error"
 
+	SkippedQueries      = "skipped.queries"
+	SkippedStmtExecutes = "skipped.stmt.prepares"
+	SkippedStmtPrepares = "skipped.stmt.executes"
+
 	FailedQueries      = "err.queries"
 	FailedStmtExecutes = "err.stmt.executes"
 	FailedStmtPrepares = "err.stmt.prepares"
@@ -47,6 +51,10 @@ var (
 	nComExecuteTotal int64
 	nComExecuteError int64
 
+	nSkippedQueries      int64
+	nSkippedStmtExecutes int64
+	nSkippedStmtPrepares int64
+
 	nErrQueries      int64
 	nErrStmtExecutes int64
 	nErrStmtPrepares int64
@@ -60,7 +68,10 @@ var (
 		Packets, Queries, StmtExecutes, StmtPrepares, Streams, Connections,
 		ComQueryTotal, ComPrepareTotal, ComExecuteTotal,
 		ComQueryError, ComPrepareError, ComExecuteError,
-		FailedQueries, FailedStmtExecutes, FailedStmtPrepares, ConnWaiting, ConnRunning}
+		SkippedQueries, SkippedStmtExecutes, SkippedStmtPrepares,
+		FailedQueries, FailedStmtExecutes, FailedStmtPrepares,
+		ConnWaiting, ConnRunning,
+	}
 	others = make(map[string]int64)
 	lock   sync.RWMutex
 )
@@ -99,6 +110,12 @@ func Add(name string, delta int64) int64 {
 		return atomic.AddInt64(&nComPrepareTotal, delta)
 	case ComPrepareError:
 		return atomic.AddInt64(&nComPrepareError, delta)
+	case SkippedQueries:
+		return atomic.AddInt64(&nSkippedQueries, delta)
+	case SkippedStmtExecutes:
+		return atomic.AddInt64(&nSkippedStmtPrepares, delta)
+	case SkippedStmtPrepares:
+		return atomic.AddInt64(&nSkippedStmtExecutes, delta)
 	case FailedQueries:
 		return atomic.AddInt64(&nErrQueries, delta)
 	case FailedStmtExecutes:
@@ -147,6 +164,12 @@ func Get(name string) int64 {
 		return atomic.LoadInt64(&nComPrepareTotal)
 	case ComPrepareError:
 		return atomic.LoadInt64(&nComPrepareError)
+	case SkippedQueries:
+		return atomic.LoadInt64(&nSkippedQueries)
+	case SkippedStmtExecutes:
+		return atomic.LoadInt64(&nSkippedStmtPrepares)
+	case SkippedStmtPrepares:
+		return atomic.LoadInt64(&nSkippedStmtExecutes)
 	case FailedQueries:
 		return atomic.LoadInt64(&nErrQueries)
 	case FailedStmtExecutes:
