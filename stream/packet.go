@@ -1,16 +1,20 @@
 package stream
 
 import (
+	"context"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/reassembly"
+	"github.com/pingcap/errors"
 	"github.com/zyguan/mysql-replay/stats"
 	"go.uber.org/zap"
 )
@@ -89,7 +93,7 @@ type ReplayOptions struct {
 
 func (o ReplayOptions) NewPacketHandler(conn ConnID) MySQLPacketHandler {
 	log := conn.Logger("mysql-stream")
-	rh := &replayHandler{lock: &sync.Mutex{}, opts: o, conn: conn, log: log, fsm: NewMySQLFSM(log), stmts: make(map[uint32]*sql.Stmt)}
+	rh := &replayHandler{ctx: context.Background(), opts: o, conn: conn, log: log, fsm: NewMySQLFSM(log)}
 	if len(o.FilterIn) >= 0 {
 		if p, err := regexp.Compile(o.FilterIn); err != nil {
 			log.Warn("invalid filter-in regexp", zap.Error(err))
@@ -119,28 +123,64 @@ func (o ReplayOptions) NewPacketHandler(conn ConnID) MySQLPacketHandler {
 		return rh
 	}
 	var err error
+
+	rh.log.Info("open database to " + rh.opts.TargetDSN)
 	rh.db, err = sql.Open("mysql", o.TargetDSN)
 	if err != nil {
 		log.Error("reject connection due to error",
 			zap.String("dsn", o.TargetDSN), zap.Error(err))
 		return RejectConn(conn)
 	}
-	rh.log.Debug("open connection to " + rh.opts.TargetDSN)
+	if err := rh.db.Ping(); err != nil {
+		return RejectConn(conn)
+	}
 	stats.Add(stats.Connections, 1)
 	return rh
 }
 
 var _ MySQLPacketHandler = &replayHandler{}
 
+type Conn struct {
+	sync.RWMutex
+	conn  *sql.Conn
+	stmts map[uint32]statement
+	// conn use lastest time
+	lastUsed time.Time
+}
+
+type statement struct {
+	query  string
+	handle *sql.Stmt
+}
+
+func NewConn(conn *sql.Conn) *Conn {
+	return &Conn{
+		conn:  conn,
+		stmts: make(map[uint32]statement),
+	}
+}
+
+func (c *Conn) UpdateLastUsed() {
+	c.Lock()
+	defer c.Unlock()
+	c.lastUsed = time.Now()
+}
+
+func (c *Conn) GetLastUsed() time.Time {
+	c.RLock()
+	defer c.RUnlock()
+	return c.lastUsed
+}
+
 type replayHandler struct {
-	lock   *sync.Mutex
+	ctx    context.Context
 	opts   ReplayOptions
 	conn   ConnID
 	fsm    *MySQLFSM
 	log    *zap.Logger
 	db     *sql.DB
+	dbConn sync.Map
 	filter func(s string) bool
-	stmts  map[uint32]*sql.Stmt
 }
 
 func (rh *replayHandler) Accept(ci gopacket.CaptureInfo, dir reassembly.TCPFlowDirection, tcp *layers.TCP) bool {
@@ -148,168 +188,321 @@ func (rh *replayHandler) Accept(ci gopacket.CaptureInfo, dir reassembly.TCPFlowD
 }
 
 func (rh *replayHandler) OnPacket(pkt MySQLPacket) {
-	rh.lock.Lock()
-	defer rh.lock.Unlock()
-
 	rh.fsm.Handle(pkt)
 	if !rh.fsm.Ready() || !rh.fsm.Changed() {
 		return
 	}
 	switch rh.fsm.State() {
 	case StateComQuery:
-		stats.Add(stats.Queries, 1)
-		query := rh.fsm.Query()
-		if rh.filter != nil && !rh.filter(query) {
-			return
-		}
-		if rh.db == nil {
-			rh.l(pkt.Dir).Info("execute query", zap.String("sql", query))
-			return
-		}
-		if _, err := rh.db.Exec(query); err != nil {
+		rh.l(pkt.Dir).Warn("execute query",
+			zap.Any("state", rh.fsm.state),
+			zap.Uint32("id", rh.fsm.stmt.ID),
+			zap.String("sql", rh.fsm.stmt.Query),
+			zap.Any("params", rh.fsm.params),
+			zap.Any("maps", rh.fsm.stmts))
+		if err := rh.execute(rh.ctx, rh.connID(), rh.fsm.query); err != nil {
 			rh.l(pkt.Dir).Error("execute query",
-				zap.String("sql", query),
+				zap.String("sql", rh.fsm.query),
 				zap.Error(err))
-			stats.Add(stats.FailedQueries, 1)
 		}
 	case StateComStmtExecute:
-		rh.log.Warn("execute stmt query",
-			zap.Uint32("id", rh.fsm.Stmt().ID),
-			zap.String("sql", rh.fsm.Stmt().Query),
-			zap.Any("params", rh.fsm.StmtParams()))
-
-		stats.Add(stats.StmtExecutes, 1)
-		stmt := rh.getStmt(rh.fsm.Stmt().ID)
-		if stmt != nil && len(rh.fsm.StmtParams()) > 0 {
-			if _, err := stmt.Exec(rh.fsm.StmtParams()...); err != nil {
-				rh.l(pkt.Dir).Error("stmt execute query",
-					zap.String("sql", rh.fsm.Stmt().Query),
-					zap.Any("params", rh.fsm.StmtParams()),
-					zap.Error(err))
-				stats.Add(stats.FailedStmtExecutes, 1)
-			}
-		} else if stmt == nil && len(rh.fsm.StmtParams()) > 0 {
-			stats.Add(stats.StmtPrepares, 1)
-			query := rh.fsm.Stmt().Query
-			if rh.filter != nil && !rh.filter(query) {
-				return
-			}
-			if err := rh.prepareStmt(rh.fsm.Stmt().ID, query); err != nil {
-				rh.l(pkt.Dir).Error("stmt execute query",
-					zap.String("sql", rh.fsm.Stmt().Query),
-					zap.Any("params", rh.fsm.StmtParams()),
-					zap.Error(err))
-				stats.Add(stats.FailedStmtPrepares, 1)
-			}
-			stmt := rh.getStmt(rh.fsm.Stmt().ID)
-			if _, err := stmt.Exec(rh.fsm.StmtParams()...); err != nil {
-				rh.l(pkt.Dir).Error("stmt execute query",
-					zap.String("sql", rh.fsm.Stmt().Query),
-					zap.Any("params", rh.fsm.StmtParams()),
-					zap.Error(err))
-				stats.Add(stats.FailedStmtExecutes, 1)
-			}
-		} else {
-			rh.l(pkt.Dir).Error("stmt execute query",
-				zap.String("sql", rh.fsm.Stmt().Query),
-				zap.Any("params", rh.fsm.StmtParams()),
-				zap.Any("stmt", rh.fsm.stmts),
-				zap.Error(fmt.Errorf("stmt execute query error")))
-			stats.Add(stats.FailedStmtExecutes, 1)
+		rh.l(pkt.Dir).Warn("execute stmt query",
+			zap.Any("state", rh.fsm.state),
+			zap.Uint32("id", rh.fsm.stmt.ID),
+			zap.String("sql", rh.fsm.stmt.Query),
+			zap.Any("params", rh.fsm.params),
+			zap.Any("maps", rh.fsm.stmts))
+		if err := rh.stmtExecute(rh.ctx, rh.connID(), rh.fsm.stmt.ID, rh.fsm.params); err != nil {
+			rh.l(pkt.Dir).Error("execute stmt query",
+				zap.Uint32("id", rh.fsm.stmt.ID),
+				zap.String("sql", rh.fsm.query),
+				zap.Any("params", rh.fsm.params),
+				zap.Error(err))
 		}
 	case StateComStmtClose:
-		stats.Add(stats.StmtExecutes, 1)
-		if err := rh.closeStmt(rh.fsm.Stmt().ID); err != nil {
-			rh.l(pkt.Dir).Error("close stmt query",
-				zap.Uint32("id", rh.fsm.Stmt().ID),
-				zap.String("sql", rh.fsm.Stmt().Query),
-				zap.Any("params", rh.fsm.StmtParams()),
-				zap.Any("stmt", rh.fsm.stmts),
+		rh.l(pkt.Dir).Warn("closed stmt query",
+			zap.Any("state", rh.fsm.state),
+			zap.Uint32("id", rh.fsm.stmt.ID),
+			zap.String("sql", rh.fsm.stmt.Query),
+			zap.Any("params", rh.fsm.params),
+			zap.Any("maps", rh.fsm.stmts))
+		if err := rh.stmtClose(rh.connID(), rh.fsm.stmt.ID); err != nil {
+			rh.l(pkt.Dir).Error("closed stmt query",
+				zap.Uint32("id", rh.fsm.stmt.ID),
+				zap.String("sql", rh.fsm.query),
+				zap.Any("params", rh.fsm.params),
 				zap.Error(err))
-			stats.Add(stats.FailedStmtExecutes, 1)
 		}
-	case StateComStmtPrepare0:
-		// query := rh.fsm.Stmt().Query
-		// if rh.filter != nil && !rh.filter(query) {
-		// 	return
-		// }
-		rh.log.Warn("prepare stmt query0",
-			zap.Uint32("id", rh.fsm.Stmt().ID),
-			zap.String("sql", rh.fsm.Stmt().Query),
-			zap.Any("params", rh.fsm.StmtParams()),
-			zap.Any("stmt", rh.getStmt(rh.fsm.Stmt().ID)))
-
-		if rh.getStmt(rh.fsm.Stmt().ID) == nil {
-			stats.Add(stats.StmtPrepares, 1)
-			if err := rh.prepareStmt(rh.fsm.Stmt().ID, rh.fsm.Stmt().Query); err != nil {
-				rh.l(pkt.Dir).Error("prepare stmt query",
-					zap.Uint32("id", rh.fsm.Stmt().ID),
-					zap.String("sql", rh.fsm.Stmt().Query),
-					zap.Error(err))
-				stats.Add(stats.FailedStmtPrepares, 1)
-			}
+	case StateComStmtPrepare0, StateComStmtPrepare1:
+		rh.l(pkt.Dir).Warn("prepare stmt query",
+			zap.Any("state", rh.fsm.state),
+			zap.Uint32("id", rh.fsm.stmt.ID),
+			zap.String("sql", rh.fsm.stmt.Query),
+			zap.Any("params", rh.fsm.params),
+			zap.Any("maps", rh.fsm.stmts))
+		// StateComStmtPrepare0 indicates that the MySQLFSM prepare process has been entered.
+		// After the process is completed, the state is set to StateComStmtPrepare1. Therefore, you only need to monitor the statement of StateComStmtPrepare1.
+		if err := rh.stmtPrepare(rh.ctx, rh.connID(), rh.fsm.stmt.ID, rh.fsm.stmt.Query); err != nil {
+			rh.l(pkt.Dir).Error("prepare stmt query",
+				zap.Uint32("id", rh.fsm.stmt.ID),
+				zap.String("sql", rh.fsm.query),
+				zap.Any("params", rh.fsm.params),
+				zap.Error(err))
 		}
-	case StateComStmtPrepare1:
-		rh.log.Warn("prepare stmt query0",
-			zap.Uint32("id", rh.fsm.Stmt().ID),
-			zap.String("sql", rh.fsm.Stmt().Query),
-			zap.Any("params", rh.fsm.StmtParams()),
-			zap.Any("stmt", rh.getStmt(rh.fsm.Stmt().ID)))
 	case StateComQuit:
-		rh.OnClose()
-		rh.log.Warn("quit command query", zap.String("close connection", rh.opts.TargetDSN))
-		// case StateHandshake0, StateHandshake1:
-		// 	return
-		// default:
-		// 	return
+		rh.l(pkt.Dir).Warn("quit command query",
+			zap.Any("state", rh.fsm.state),
+			zap.Uint32("id", rh.fsm.stmt.ID),
+			zap.String("sql", rh.fsm.stmt.Query),
+			zap.Any("params", rh.fsm.params),
+			zap.Any("maps", rh.fsm.stmts))
+		if err := rh.quitConn(rh.connID()); err != nil {
+			rh.l(pkt.Dir).Error("quit command query",
+				zap.Uint32("id", rh.fsm.stmt.ID),
+				zap.String("sql", rh.fsm.query),
+				zap.Any("params", rh.fsm.params),
+				zap.Error(err))
+		}
+	case StateHandshake0, StateHandshake1:
+		rh.l(pkt.Dir).Warn("handshake event",
+			zap.Int("state", rh.fsm.state),
+			zap.Uint32("id", rh.fsm.Stmt().ID),
+			zap.String("schema", rh.fsm.schema),
+			zap.String("sql", rh.fsm.Stmt().Query),
+			zap.Any("params", rh.fsm.StmtParams()),
+			zap.String("sql", rh.fsm.stmt.Query),
+			zap.Any("maps", rh.fsm.stmts))
+		// StateHandshake0 indicates the start of the MySQLFSM process. When the process is complete and the connection is normal, fsm.schema is set to ok and the state is changed to StateHandshake1.
+		if err := rh.handshake(rh.ctx, rh.connID()); err != nil {
+			rh.l(pkt.Dir).Error("handshake query",
+				zap.Error(err))
+		}
+	default:
+		rh.l(pkt.Dir).Warn("unknown event",
+			zap.Int("state", rh.fsm.state),
+			zap.Uint32("id", rh.fsm.Stmt().ID),
+			zap.String("schema", rh.fsm.schema),
+			zap.String("sql", rh.fsm.Stmt().Query),
+			zap.Any("params", rh.fsm.StmtParams()),
+			zap.String("sql", rh.fsm.stmt.Query),
+			zap.Any("maps", rh.fsm.stmts))
 	}
 }
 
-func (rh *replayHandler) prepareStmt(id uint32, sqlStr string) error {
-	rh.lock.Lock()
-	defer rh.lock.Unlock()
-	stmt, err := rh.db.Prepare(sqlStr)
+func (rh *replayHandler) handshake(ctx context.Context, connID string) error {
+	_, err := rh.getConn(ctx, connID)
+	return err
+}
+
+func (rh *replayHandler) execute(ctx context.Context, connID, query string) error {
+	if rh.filter != nil && !rh.filter(query) {
+		stats.Add(stats.SkippedQueries, 1)
+		return nil
+	}
+	conn, err := rh.getConn(ctx, connID)
 	if err != nil {
 		return err
 	}
-	rh.stmts[id] = stmt
-	return nil
-}
 
-func (rh *replayHandler) getStmt(id uint32) *sql.Stmt {
-	rh.lock.Lock()
-	defer rh.lock.Unlock()
-
-	if stmt, ok := rh.stmts[id]; ok {
-		return stmt
+	stats.Add(stats.Queries, 1)
+	stats.Add(stats.ConnRunning, 1)
+	_, err = conn.ExecContext(ctx, query)
+	stats.Add(stats.ConnRunning, -1)
+	if err != nil {
+		stats.Add(stats.FailedQueries, 1)
+		return errors.Trace(err)
 	}
 	return nil
 }
 
-func (rh *replayHandler) closeStmt(id uint32) error {
-	rh.lock.Lock()
-	defer rh.lock.Unlock()
+func (rh *replayHandler) getConn(ctx context.Context, connID string) (*sql.Conn, error) {
+	if rh.db == nil {
+		return nil, fmt.Errorf("reject connection due to error, the dsn [%s] database not open", rh.opts.TargetDSN)
+	}
 
-	if stmt, ok := rh.stmts[id]; ok {
-		if err := stmt.Close(); err != nil {
-			return err
+	conn, ok := rh.dbConn.Load(connID)
+	if ok {
+		conn.(*Conn).Lock()
+		defer conn.(*Conn).Unlock()
+		if conn.(*Conn).conn != nil {
+			rh.log.Info("get connection to " + connID)
+			conn.(*Conn).UpdateLastUsed()
+			return conn.(*Conn).conn, nil
+		} else {
+			conn, err := rh.db.Conn(ctx)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			newConn := NewConn(conn)
+			newConn.UpdateLastUsed()
+
+			rh.dbConn.Store(connID, newConn)
+			rh.log.Info("open connection to " + rh.opts.TargetDSN)
+			stats.Add(stats.Connections, 1)
+
+			return conn, nil
 		}
+	} else {
+		conn, err := rh.db.Conn(ctx)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		newConn := NewConn(conn)
+		newConn.UpdateLastUsed()
+
+		rh.dbConn.Store(connID, newConn)
+		rh.log.Info("open connection to " + rh.opts.TargetDSN)
+		stats.Add(stats.Connections, 1)
+
+		return conn, nil
 	}
-	delete(rh.stmts, id)
+}
+
+func (rh *replayHandler) connID() string {
+	return fmt.Sprintf("%s:%s", rh.conn.HashStr(), rh.conn.SrcAddr())
+}
+
+func (rh *replayHandler) stmtExecute(ctx context.Context, connID string, id uint32, params []interface{}) error {
+	stmt, err := rh.getStmt(ctx, connID, id)
+	if err != nil {
+		if rh.filter != nil && strings.HasPrefix(err.Error(), "no such statement") {
+			stats.Add(stats.SkippedStmtExecutes, 1)
+			return nil
+		}
+		return err
+	}
+
+	stats.Add(stats.StmtExecutes, 1)
+	stats.Add(stats.ConnRunning, 1)
+	_, err = stmt.ExecContext(ctx, params...)
+	stats.Add(stats.ConnRunning, -1)
+	if err != nil {
+		stats.Add(stats.FailedStmtExecutes, 1)
+		return errors.Trace(err)
+	}
 	return nil
+}
+
+func (rh *replayHandler) stmtPrepare(ctx context.Context, connID string, id uint32, query string) error {
+	if rh.filter != nil && !rh.filter(query) {
+		stats.Add(stats.SkippedStmtPrepares, 1)
+		return nil
+	}
+
+	conn, ok := rh.dbConn.Load(connID)
+	if !ok {
+		return fmt.Errorf("no such conn id [%s]", connID)
+	}
+
+	conn.(*Conn).Lock()
+	defer conn.(*Conn).Unlock()
+
+	stmt, ok := conn.(*Conn).stmts[id]
+	if ok && (stmt.query == query && stmt.handle != nil) {
+		conn.(*Conn).UpdateLastUsed()
+		rh.log.Warn("preapre stmt reuse", zap.Uint32("id", id), zap.String("query", query), zap.String("stmt existed", "skip prepare"))
+		return nil
+	}
+
+	stmt.query = query
+	if stmt.handle != nil {
+		stmt.handle.Close()
+		stmt.handle = nil
+	}
+
+	delete(conn.(*Conn).stmts, id)
+	prepareConn, err := rh.getConn(ctx, connID)
+	if err != nil {
+		return err
+	}
+	stats.Add(stats.StmtPrepares, 1)
+	stmt.handle, err = prepareConn.PrepareContext(ctx, stmt.query)
+	if err != nil {
+		stats.Add(stats.FailedStmtPrepares, 1)
+		return errors.Trace(err)
+	}
+	conn.(*Conn).stmts[id] = stmt
+	return nil
+}
+
+func (rh *replayHandler) stmtClose(connID string, id uint32) error {
+	conn, ok := rh.dbConn.Load(connID)
+	if !ok {
+		return fmt.Errorf("no such conn id [%s]", connID)
+	}
+
+	conn.(*Conn).Lock()
+	defer conn.(*Conn).Unlock()
+
+	stmt, ok := conn.(*Conn).stmts[id]
+	if !ok {
+		return fmt.Errorf("no such conn id [%s] and stmt id [%d]", connID, id)
+	}
+	if stmt.handle != nil {
+		stmt.handle.Close()
+		stmt.handle = nil
+	}
+	delete(conn.(*Conn).stmts, id)
+	conn.(*Conn).UpdateLastUsed()
+	return nil
+}
+
+func (rh *replayHandler) quitConn(connID string) error {
+	conn, ok := rh.dbConn.Load(connID)
+	if !ok {
+		return fmt.Errorf("no such conn id [%s]", connID)
+	}
+
+	conn.(*Conn).Lock()
+	defer conn.(*Conn).Unlock()
+
+	conn.(*Conn).conn.Raw(func(driverConn interface{}) error {
+		if dc, ok := driverConn.(io.Closer); ok {
+			dc.Close()
+		}
+		return nil
+	})
+	conn.(*Conn).conn.Close()
+	conn = nil
+	stats.Add(stats.Connections, -1)
+
+	return nil
+}
+
+func (rh *replayHandler) getStmt(ctx context.Context, connID string, id uint32) (*sql.Stmt, error) {
+	conn, ok := rh.dbConn.Load(connID)
+	if !ok {
+		return nil, fmt.Errorf("no such conn id [%s]", connID)
+	}
+	conn.(*Conn).Lock()
+	defer conn.(*Conn).Unlock()
+
+	stmt, ok := conn.(*Conn).stmts[id]
+
+	if ok && stmt.handle != nil {
+		conn.(*Conn).UpdateLastUsed()
+		return stmt.handle, nil
+	} else if !ok {
+		return nil, errors.Errorf("no such statement #%d", id)
+	}
+	preConn, err := rh.getConn(ctx, connID)
+	if err != nil {
+		return nil, err
+	}
+	stmt.handle, err = preConn.PrepareContext(ctx, stmt.query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	conn.(*Conn).stmts[id] = stmt
+	return stmt.handle, nil
 }
 
 func (rh *replayHandler) OnClose() {
-	rh.lock.Lock()
-	defer rh.lock.Unlock()
-
-	rh.log.Debug("close connection to " + rh.opts.TargetDSN)
+	rh.log.Info("close connection to " + rh.opts.TargetDSN)
 	if rh.db != nil {
 		rh.db.Close()
 		stats.Add(stats.Connections, -1)
 	}
-	// reset
-	rh.stmts = make(map[uint32]*sql.Stmt)
 }
 
 func (rh *replayHandler) l(dir reassembly.TCPFlowDirection) *zap.Logger {

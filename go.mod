@@ -7,6 +7,7 @@ require (
 	github.com/gocraft/dbr/v2 v2.7.2
 	github.com/google/gopacket v1.1.17
 	github.com/mattn/go-sqlite3 v1.14.7
+	github.com/ngaut/log v0.0.0-20221012222132-f3329cba28a5
 	github.com/pingcap/errors v0.11.4
 	github.com/pkg/profile v1.6.0
 	github.com/spf13/cobra v0.0.5
